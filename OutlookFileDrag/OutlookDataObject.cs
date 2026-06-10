@@ -263,16 +263,20 @@ namespace OutlookFileDrag
             log.DebugFormat("Temp folder: {0}", tempPath);
 
             //Save files to temporary directory
-            tempFilenames = new string[filenames.Length];
+            string[] extractedFilenames = new string[filenames.Length];
             for (int fileIndex = 0; fileIndex < filenames.Length; fileIndex++)
             {
-                tempFilenames[fileIndex] = FileUtility.GetUniqueFilename(Path.Combine(tempPath, filenames[fileIndex]));
+                extractedFilenames[fileIndex] = FileUtility.GetUniqueFilename(Path.Combine(tempPath, filenames[fileIndex]));
                 log.DebugFormat("Extracting file {0}", filenames[fileIndex]);
-                using (FileStream fs = new FileStream(tempFilenames[fileIndex], FileMode.Create))
+                using (FileStream fs = new FileStream(extractedFilenames[fileIndex], FileMode.Create))
                 {
                     DataObjectHelper.ReadFileContents(this.innerData, fileIndex, fs);
                 }
             }
+
+            //Cache filenames only after all files extracted successfully so a failed
+            //extraction is retried instead of reusing a partial file list
+            tempFilenames = extractedFilenames;
         }
 
         public CustomQueryInterfaceResult GetInterface(ref Guid iid, out IntPtr ppv)
@@ -293,7 +297,16 @@ namespace OutlookFileDrag
                 {
                     //For all other interfaces, use interface on original object
                     IntPtr pUnk = Marshal.GetIUnknownForObject(this.innerData);
-                    int retVal = Marshal.QueryInterface(pUnk, ref iid, out ppv);
+                    int retVal;
+                    try
+                    {
+                        retVal = Marshal.QueryInterface(pUnk, ref iid, out ppv);
+                    }
+                    finally
+                    {
+                        //Release reference added by GetIUnknownForObject
+                        Marshal.Release(pUnk);
+                    }
                     if (retVal == NativeMethods.S_OK)
                     {
                         log.DebugFormat("Interface handled by inner object");
