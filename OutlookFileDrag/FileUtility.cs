@@ -1,5 +1,7 @@
-﻿using System;
+using System;
+using System.Configuration;
 using System.IO;
+using System.Text.RegularExpressions;
 using log4net;
 
 namespace OutlookFileDrag
@@ -33,7 +35,7 @@ namespace OutlookFileDrag
             foreach(DirectoryInfo subfolder in dirInfo.GetDirectories())
             {
                 //If folder was created before expiration window, delete it
-                if (subfolder.CreationTime < DateTime.Now.AddMinutes(tempFileExpiration))
+                if (subfolder.CreationTime < DateTime.Now.AddMinutes(-tempFileExpiration))
                     try
                     {
                         log.InfoFormat("Deleting temp folder: {0}", subfolder.FullName);
@@ -50,6 +52,8 @@ namespace OutlookFileDrag
         {
             string filenameNoExt;
             string ext;
+
+            filename = SanitizeFilename(filename);
 
             //If filename is too long, truncate filename
             if (filename.Length >= NativeMethods.MAX_PATH)
@@ -84,6 +88,25 @@ namespace OutlookFileDrag
             throw new Exception(string.Format("Could not generate unique filename for file {0}", filename));
         }
 
+        private static string SanitizeFilename(string filename)
+        {
+            bool replaceSpecialChars;
+            if (!bool.TryParse(ConfigurationManager.AppSettings["ReplaceSpecialChars"], out replaceSpecialChars) || !replaceSpecialChars)
+                return filename;
 
+            string justPath = Path.GetDirectoryName(filename);
+            string justFilenameNoExt = Path.GetFileNameWithoutExtension(filename);
+            string justExt = Path.GetExtension(filename);
+            string justFilenameNoExtSimple = Regex.Replace(justFilenameNoExt, @"[^a-zA-Z0-9]+", "_").Trim('_');
+
+            if (string.IsNullOrEmpty(justFilenameNoExtSimple))
+                justFilenameNoExtSimple = "OutlookFileDrag";
+
+            string sanitizedFilename = Path.Combine(justPath, justFilenameNoExtSimple + justExt);
+            if (!string.Equals(filename, sanitizedFilename, StringComparison.OrdinalIgnoreCase))
+                log.InfoFormat("Using {0} as CF_HDROP filename instead of {1}", sanitizedFilename, filename);
+
+            return sanitizedFilename;
+        }
     }
 }
