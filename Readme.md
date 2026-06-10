@@ -1,4 +1,4 @@
-# Outlook File Drag
+﻿# Outlook File Drag
 
 *Drag and drop Outlook items as files into any application*
 
