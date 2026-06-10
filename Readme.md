@@ -40,6 +40,17 @@ later in a cleanup process.
 - Drag multiple items at once
 - Supports Unicode characters
 
+## Fork hardening notes
+
+This fork includes additional drag/drop hardening for environments that still require physical-file drops:
+
+- Fixed `ReadHGlobalIntoStream` so HGLOBAL reads advance by offset instead of repeatedly copying the first 4 KB.
+- Fixed temporary folder cleanup so only folders older than `TempFileExpiration` are removed.
+- Added optional temporary filename normalization through `ReplaceSpecialChars` in `App.config`.
+- Added an `OutputDebugStringAppender` for live drag/drop diagnostics with DebugView or a debugger.
+
+Logs are written to `%APPDATA%\OutlookFileDrag\OutlookFileDrag.log`.
+
 ## Installation
 
 To install, run the installer that matches your Windows build:
@@ -100,6 +111,12 @@ If you find this project useful, please consider donating.  Your donations are a
 [![Donate](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=BSAGCF5VAJLN2)
 
 ## Version History
+
+### Fork hardening
+- Fixed HGLOBAL stream-copy offset for descriptor payloads over 4 KB.
+- Fixed temp cleanup expiration comparison.
+- Added optional temp filename normalization.
+- Added debug-output logging appender.
 
 ### 1.0.11
 - Fixed drag and drop of embedded RTF attachments (thanks chrisv2)

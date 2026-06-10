@@ -58,7 +58,7 @@ namespace OutlookFileDrag
             //Load structure into medium
             medium.unionmember = ptrDropFiles;
             medium.tymed = TYMED.TYMED_HGLOBAL;
-            medium.pUnkForRelease = IntPtr.Zero;        //HGLOBAL to be released by caller
+            medium.pUnkForRelease = null;        //HGLOBAL to be released by caller
         }
 
         internal static string[] GetFilenames(NativeMethods.IDataObject data)
@@ -293,13 +293,14 @@ namespace OutlookFileDrag
             //To handle a IStorage it needs to be written into a second unmanaged memory mapped storage 
             //and then the data can be read from memory into a managed byte and returned as a MemoryStream
 
+            NativeMethods.IStorage iStorage = null;
             NativeMethods.ILockBytes iLockBytes = null;
             NativeMethods.IStorage iStorageNew = null;
             IntPtr ptrRead = IntPtr.Zero;
             try
             {
                 //Marshal pointer to an IStorage object
-                NativeMethods.IStorage iStorage = (NativeMethods.IStorage)Marshal.GetObjectForIUnknown(handle);
+                iStorage = (NativeMethods.IStorage)Marshal.GetObjectForIUnknown(handle);
 
                 //Create an ILockBytes object on a HGlobal, then create a IStorage object on top of the ILockBytes object
                 iLockBytes = NativeMethods.CreateILockBytesOnHGlobal(IntPtr.Zero, true);
@@ -338,16 +339,19 @@ namespace OutlookFileDrag
                     Marshal.ReleaseComObject(iStorageNew);
                 if (iLockBytes != null)
                     Marshal.ReleaseComObject(iLockBytes);
+                if (iStorage != null)
+                    Marshal.ReleaseComObject(iStorage);
             }
         }
 
         private static void ReadIStreamIntoStream(IntPtr handle, Stream stream)
         {
+            IStream iStream = null;
             IntPtr ptrRead = IntPtr.Zero;
             try
             {
                 //Marshal pointer to an IStream object
-                IStream iStream = (IStream)Marshal.GetObjectForIUnknown(handle);
+                iStream = (IStream)Marshal.GetObjectForIUnknown(handle);
 
                 //Create pointer to integer that stores # of bytes read
                 ptrRead = Marshal.AllocCoTaskMem(sizeof(int));
@@ -369,6 +373,8 @@ namespace OutlookFileDrag
             {
                 //Release all unmanaged objects
                 Marshal.FreeCoTaskMem(ptrRead);
+                if (iStream != null)
+                    Marshal.ReleaseComObject(iStream);
             }
 
         }
@@ -392,7 +398,7 @@ namespace OutlookFileDrag
                 {
                     //Copy buffer length or remaining length, whichever is smaller
                     bytesToCopy = Math.Min(buffer.Length, length - offset);
-                    Marshal.Copy(source, buffer, 0, bytesToCopy);
+                    Marshal.Copy(IntPtr.Add(source, offset), buffer, 0, bytesToCopy);
                     stream.Write(buffer, 0, bytesToCopy);
                 }
             }
