@@ -94,15 +94,26 @@ namespace OutlookFileDrag
             if (!bool.TryParse(ConfigurationManager.AppSettings["ReplaceSpecialChars"], out replaceSpecialChars) || !replaceSpecialChars)
                 return filename;
 
-            string justPath = Path.GetDirectoryName(filename);
-            string justFilenameNoExt = Path.GetFileNameWithoutExtension(filename);
-            string justExt = Path.GetExtension(filename);
+            //Split path and filename manually -- Path helpers validate the path and throw
+            //for characters such as ':' that descriptor names from message subjects can contain
+            int filenameIndex = filename.LastIndexOfAny(new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }) + 1;
+            string justPath = filename.Substring(0, filenameIndex);
+            string justFilename = filename.Substring(filenameIndex);
+
+            int extIndex = justFilename.LastIndexOf('.');
+            string justFilenameNoExt = extIndex >= 0 ? justFilename.Substring(0, extIndex) : justFilename;
+            string justExt = extIndex >= 0 ? justFilename.Substring(extIndex) : string.Empty;
+
             string justFilenameNoExtSimple = Regex.Replace(justFilenameNoExt, @"[^\p{L}\p{Nd}]+", "_").Trim('_');
 
             if (string.IsNullOrEmpty(justFilenameNoExtSimple))
                 justFilenameNoExtSimple = "OutlookFileDrag";
 
-            string sanitizedFilename = Path.Combine(justPath, justFilenameNoExtSimple + justExt);
+            //Replace invalid characters in extension as well
+            foreach (char invalidChar in Path.GetInvalidFileNameChars())
+                justExt = justExt.Replace(invalidChar, '_');
+
+            string sanitizedFilename = justPath + justFilenameNoExtSimple + justExt;
             if (!string.Equals(filename, sanitizedFilename, StringComparison.OrdinalIgnoreCase))
                 log.InfoFormat("Using {0} as CF_HDROP filename instead of {1}", sanitizedFilename, filename);
 
