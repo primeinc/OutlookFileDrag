@@ -44,9 +44,12 @@ namespace OutlookFileDrag
             string filenameList = string.Join("\0", filenames) + "\0\0";
             byte[] filenameBytes = System.Text.Encoding.Unicode.GetBytes(filenameList);
 
-            //Allocate global memory and get pointer
+            //Allocate global memory and get pointer.  Use GlobalAlloc so the allocator matches the
+            //GlobalFree the drop target uses to release this TYMED_HGLOBAL medium (pUnkForRelease == null).
             int dataLength = Marshal.SizeOf(dropFiles) + filenameBytes.Length;
-            IntPtr ptrDropFiles = Marshal.AllocHGlobal(dataLength);
+            IntPtr ptrDropFiles = NativeMethods.GlobalAlloc(NativeMethods.GMEM_FIXED, (UIntPtr)dataLength);
+            if (ptrDropFiles == IntPtr.Zero)
+                throw new OutOfMemoryException("GlobalAlloc failed for CF_HDROP medium");
 
             //Copy DROPFILES structure to global memory.
             Marshal.StructureToPtr(dropFiles, ptrDropFiles, true);

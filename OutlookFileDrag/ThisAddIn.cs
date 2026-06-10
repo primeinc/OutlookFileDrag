@@ -34,15 +34,68 @@ namespace OutlookFileDrag
                 log.InfoFormat("Starting cleanup timer -- run every {0} minutes", cleanupTimerInterval);
                 cleanupTimer = new System.Threading.Timer(CleanupTimer_Callback, null, 0, cleanupTimerInterval * 60 * 1000);
 
-                //Start hook;
-                hook = new DragDropHook();
-                hook.Start();
+                //Start hook (unless disabled via the kill-switch -- lets IT neuter interception
+                //fleet-wide without uninstalling when a future Office build breaks it)
+                if (HookEnabled())
+                {
+                    hook = new DragDropHook();
+                    hook.Start();
+
+                    //Outlook no longer reliably raises Shutdown, so restore the import slots on
+                    //process exit to avoid leaving a dangling redirect if the add-in is unloaded.
+                    AppDomain.CurrentDomain.ProcessExit += CurrentDomain_ProcessExit;
+                }
+                else
+                {
+                    log.Info("DoDragDrop interception disabled (EnableHook=false) -- not hooking");
+                }
             }
             catch (Exception ex)
             {
                 log.Fatal("Fatal error", ex);
                 if (hook != null)
                     hook.Stop();
+            }
+        }
+
+        //Kill-switch: a registry override (HKLM or HKCU \Software\OutlookFileDrag\EnableHook = 0)
+        //takes precedence so it can be pushed via policy; otherwise the App.config value is used.
+        //Defaults to enabled when nothing is set.
+        private static bool HookEnabled()
+        {
+            foreach (var root in new[] { Microsoft.Win32.Registry.LocalMachine, Microsoft.Win32.Registry.CurrentUser })
+            {
+                try
+                {
+                    using (var key = root.OpenSubKey(@"Software\OutlookFileDrag"))
+                    {
+                        object val = key?.GetValue("EnableHook");
+                        if (val != null)
+                            return Convert.ToInt32(val) != 0;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log.WarnFormat("Could not read EnableHook registry override: {0}", ex.Message);
+                }
+            }
+
+            bool enabled;
+            if (bool.TryParse(System.Configuration.ConfigurationManager.AppSettings["EnableHook"], out enabled))
+                return enabled;
+            return true;
+        }
+
+        private void CurrentDomain_ProcessExit(object sender, EventArgs e)
+        {
+            try
+            {
+                if (hook != null)
+                    hook.Stop();
+            }
+            catch (Exception ex)
+            {
+                log.WarnFormat("Error during process-exit hook teardown: {0}", ex.Message);
             }
         }
 

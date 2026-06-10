@@ -51,6 +51,19 @@ namespace OutlookFileDrag
         [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
         public static extern int GlobalSize(IntPtr handle);
 
+        //Used to make an IAT slot writable while redirecting ole32!DoDragDrop
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool VirtualProtect(IntPtr lpAddress, IntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+        public const uint PAGE_READWRITE = 0x04;
+
+        //Allocator whose family matches the GlobalFree the drop target uses to release the CF_HDROP medium
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+        public const uint GMEM_FIXED = 0x0000;
+
         [DllImport("ole32.dll", PreserveSig = false)]
         public static extern ILockBytes CreateILockBytesOnHGlobal(IntPtr hGlobal, bool fDeleteOnRelease);
 

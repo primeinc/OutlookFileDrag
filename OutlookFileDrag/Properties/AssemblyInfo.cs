@@ -9,9 +9,9 @@ using System.Security;
 [assembly: AssemblyTitle("Outlook File Drag")]
 [assembly: AssemblyDescription("Drag and drop Outlook items and attachments as files into any application")]
 [assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("Tony Federer")]
+[assembly: AssemblyCompany("Four Pillar Productions")]
 [assembly: AssemblyProduct("Outlook File Drag")]
-[assembly: AssemblyCopyright("Copyright © 2019-2020 Tony Federer")]
+[assembly: AssemblyCopyright("Copyright © 2019-2020 Tony Federer. Updated by primeinc.")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 
@@ -33,6 +33,6 @@ using System.Security;
 // You can specify all the values or you can default the Build and Revision Numbers 
 // by using the '*' as shown below:
 // [assembly: AssemblyVersion("1.0.*")]
-[assembly: AssemblyVersion("1.0.11.0")]
-[assembly: AssemblyFileVersion("1.0.11.0")]
+[assembly: AssemblyVersion("1.0.13.0")]
+[assembly: AssemblyFileVersion("1.0.13.0")]
 

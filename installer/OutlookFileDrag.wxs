@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  OutlookFileDrag installer (WiX v5/v6).
+
+  Replaces the legacy Visual Studio Deployment Projects
+  (OutlookFileDragSetup / OutlookFileDragSetup_x64). One shared source builds
+  both architectures; the target is selected by `wix build -arch x86|x64`,
+  which sets the built-in $(sys.BUILDARCH) preprocessor variable used below.
+
+  ProductCode / UpgradeCode are preserved verbatim from the .vdproj files so
+  that existing 1.0.11 installs upgrade cleanly.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:netfx="http://wixtoolset.org/schemas/v4/wxs/netfx">
+
+  <!--
+    UpgradeCode is the upgrade anchor and MUST stay constant across releases so
+    machines already running an older build (deployed via Intune) upgrade in place.
+    ProductCode is "*" below: WiX auto-generates a fresh GUID every build, so the
+    MajorUpgrade reliably removes the previously-installed build first, with no manual
+    GUID bump per release (which is what caused the MSI 1638 between 1.0.12 builds).
+    Version flows in from build.ps1 via `-d Version=...`; the ifndef gives a default
+    so a bare `wix build` still works. Bump it by changing build.ps1 -Version only.
+  -->
+  <?ifndef Version ?><?define Version = "1.0.13" ?><?endif?>
+  <?if $(sys.BUILDARCH) = x64 ?>
+    <?define UpgradeCode = "{65870D9B-6652-4150-830B-C5199F26E62C}" ?>
+    <?define PlatformProgramFiles = "ProgramFiles64Folder" ?>
+  <?elseif $(sys.BUILDARCH) = x86 ?>
+    <?define UpgradeCode = "{2F626147-8F83-4FC1-9190-32AA4F25D487}" ?>
+    <?define PlatformProgramFiles = "ProgramFilesFolder" ?>
+  <?else?>
+    <?error Unsupported architecture: $(sys.BUILDARCH). Build with -arch x86 or -arch x64. ?>
+  <?endif?>
+
+  <Package
+      Name="Outlook File Drag"
+      Manufacturer="Four Pillar Productions"
+      Version="$(Version)"
+      ProductCode="*"
+      UpgradeCode="$(UpgradeCode)"
+      Scope="perMachine"
+      InstallerVersion="500"
+      Compressed="yes">
+
+    <!-- Reproduces vdproj RemovePreviousVersions=TRUE / DetectNewerInstalledVersion=TRUE.
+         AllowSameVersionUpgrades=yes lets Intune re-push or repair the same 1.0.12
+         build without erroring (MSI 1638) and removes any same-version old build. -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs metadata (vdproj ARP* properties). -->
+    <Property Id="ARPHELPLINK" Value="https://github.com/primeinc/OutlookFileDrag" />
+    <Property Id="ARPCONTACT" Value="primeinc" />
+    <Property Id="ARPCOMMENTS" Value="Drag and drop Outlook items as files into any application" />
+
+    <!-- .NET Framework 4.7.2+ launch condition (WixToolset.Netfx.wixext).
+         The "Installed OR ..." guard keeps uninstall/repair from being blocked. -->
+    <PropertyRef Id="WIX_IS_NETFRAMEWORK_472_OR_LATER_INSTALLED" />
+    <Launch
+        Condition="Installed OR WIX_IS_NETFRAMEWORK_472_OR_LATER_INSTALLED"
+        Message="This application requires .NET Framework 4.7.2 or later. Please install it and run setup again." />
+
+    <!-- [ProgramFiles*]\Tony Federer\Outlook File Drag -->
+    <StandardDirectory Id="$(PlatformProgramFiles)">
+      <Directory Id="MfrFolder" Name="4pp">
+        <Directory Id="INSTALLFOLDER" Name="Outlook File Drag" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- License dialog (Welcome -> License -> InstallDir -> Confirm). -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+
+    <Feature Id="Main" Title="Outlook File Drag" Level="1">
+      <ComponentGroupRef Id="ProductFiles" />
+      <ComponentGroupRef Id="LicenseFile" />
+      <ComponentGroupRef Id="AddinRegistry32" />
+      <?if $(sys.BUILDARCH) = x64 ?>
+      <ComponentGroupRef Id="AddinRegistry64" />
+      <?endif?>
+    </Feature>
+  </Package>
+
+  <!-- Payload built into OutlookFileDrag\bin\Release, supplied as a bind path
+       (`wix build -b OutlookFileDrag\bin\Release`); bare File/@Source names
+       resolve against it. License.rtf resolves against the repo-root bind path. -->
+  <Fragment>
+    <ComponentGroup Id="ProductFiles" Directory="INSTALLFOLDER">
+      <Component><File Source="OutlookFileDrag.dll" KeyPath="yes" /></Component>
+      <Component><File Source="OutlookFileDrag.dll.config" /></Component>
+      <Component><File Source="OutlookFileDrag.vsto" /></Component>
+      <Component><File Source="OutlookFileDrag.dll.manifest" /></Component>
+      <Component><File Source="log4net.dll" /></Component>
+      <Component><File Source="Microsoft.Office.Tools.dll" /></Component>
+      <Component><File Source="Microsoft.Office.Tools.Common.dll" /></Component>
+      <Component><File Source="Microsoft.Office.Tools.Common.v4.0.Utilities.dll" /></Component>
+      <Component><File Source="Microsoft.Office.Tools.Outlook.dll" /></Component>
+      <Component><File Source="Microsoft.Office.Tools.Outlook.v4.0.Utilities.dll" /></Component>
+      <Component><File Source="Microsoft.Office.Tools.v4.0.Framework.dll" /></Component>
+      <Component><File Source="Microsoft.VisualStudio.Tools.Applications.Runtime.dll" /></Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="LicenseFile" Directory="INSTALLFOLDER">
+      <Component><File Source="License.rtf" /></Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!--
+    Outlook add-in registration. Office locates the add-in by registry view:
+    32-bit Outlook reads HKLM\Software\WOW6432Node\...; 64-bit Outlook reads the
+    native HKLM\Software\... view. The hive a component writes to is governed by
+    its @Bitness (always32 -> WOW6432Node, always64 -> native), NOT by authoring
+    a literal WOW6432Node path. always64 components are only valid in an x64
+    package, so AddinRegistry64 is referenced only when BUILDARCH=x64.
+  -->
+  <Fragment>
+    <ComponentGroup Id="AddinRegistry32" Directory="INSTALLFOLDER">
+      <Component Guid="{7A3C1E94-2B6D-4F08-9C5A-1E2D3F4A5B61}" Bitness="always32">
+        <RegistryKey Root="HKLM" Key="Software\Microsoft\Office\Outlook\Addins\OutlookFileDrag">
+          <RegistryValue Name="Manifest" Type="string"
+              Value="file:///[INSTALLFOLDER]OutlookFileDrag.vsto|vstolocal" KeyPath="yes" />
+          <RegistryValue Name="FriendlyName" Type="string" Value="Outlook File Drag" />
+          <RegistryValue Name="Description" Type="string"
+              Value="Drag Outlook items as files into any application" />
+          <RegistryValue Name="LoadBehavior" Type="integer" Value="3" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="AddinRegistry64" Directory="INSTALLFOLDER">
+      <Component Guid="{6B2D0F83-1A5C-4E97-8B4A-0D1C2E3F4A52}" Bitness="always64">
+        <RegistryKey Root="HKLM" Key="Software\Microsoft\Office\Outlook\Addins\OutlookFileDrag">
+          <RegistryValue Name="Manifest" Type="string"
+              Value="file:///[INSTALLFOLDER]OutlookFileDrag.vsto|vstolocal" KeyPath="yes" />
+          <RegistryValue Name="FriendlyName" Type="string" Value="Outlook File Drag" />
+          <RegistryValue Name="Description" Type="string"
+              Value="Drag Outlook items as files into any application" />
+          <RegistryValue Name="LoadBehavior" Type="integer" Value="3" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
