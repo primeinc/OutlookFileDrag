@@ -97,7 +97,7 @@ namespace OutlookFileDrag
             string justPath = Path.GetDirectoryName(filename);
             string justFilenameNoExt = Path.GetFileNameWithoutExtension(filename);
             string justExt = Path.GetExtension(filename);
-            string justFilenameNoExtSimple = Regex.Replace(justFilenameNoExt, @"[^a-zA-Z0-9]+", "_").Trim('_');
+            string justFilenameNoExtSimple = Regex.Replace(justFilenameNoExt, @"[^\p{L}\p{Nd}]+", "_").Trim('_');
 
             if (string.IsNullOrEmpty(justFilenameNoExtSimple))
                 justFilenameNoExtSimple = "OutlookFileDrag";
