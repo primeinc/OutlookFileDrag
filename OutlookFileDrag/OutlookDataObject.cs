@@ -255,6 +255,8 @@ namespace OutlookFileDrag
             //Get filenames being dragged
             log.Debug("Getting filenames");
             string[] filenames = DataObjectHelper.GetFilenames(this.innerData);
+            if (filenames == null)
+                throw new InvalidOperationException("No file group descriptor found in data object");
             log.DebugFormat("Filenames: {0}", string.Join(",", filenames));
 
             //Get temporary folder
