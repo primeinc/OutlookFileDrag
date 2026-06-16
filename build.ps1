@@ -10,7 +10,7 @@
          irrelevant because the MSI installs per-machine into Program Files, a
          location the VSTO runtime trusts without validating the manifest signature.
       3. Build the add-in with full MSBuild (VSTO targets are absent from the dotnet SDK).
-      4. Build OutlookFileDrag-1.0.11-x86.msi and -x64.msi with `wix build`.
+      4. Build OutlookFileDrag-$Version-x86.msi and -x64.msi with `wix build`.
 
     Unsigned/self-signed output by design. Run from the repository root.
 
@@ -20,7 +20,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version       = "1.0.12",
+    [string]$Version       = "1.0.13",
     [string]$Configuration = "Release"
 )
 

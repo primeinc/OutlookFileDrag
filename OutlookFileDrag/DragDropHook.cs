@@ -51,7 +51,7 @@ namespace OutlookFileDrag
                 {
                     try
                     {
-                        PatchModule(module.BaseAddress);
+                        PatchModule(module);
                     }
                     catch (Exception ex)
                     {
@@ -133,12 +133,24 @@ namespace OutlookFileDrag
 
         // --- Import-table patching ------------------------------------------------------------
 
-        private void PatchModule(IntPtr baseAddr)
+        // Parse the module's PE import / delay-import tables to find ole32!DoDragDrop slots. Every RVA
+        // is validated against the module's mapped size (module.ModuleMemorySize) before it is read:
+        // a corrupted header, a truncated module, or one rewritten by security software must NOT cause
+        // an out-of-bounds read -> AccessViolationException is uncatchable and would fastfail OUTLOOK.EXE,
+        // the exact crash class this add-in exists to prevent.
+        private void PatchModule(ProcessModule module)
         {
+            IntPtr baseAddr = module.BaseAddress;
             long b = baseAddr.ToInt64();
+            long size = module.ModuleMemorySize;
+
+            if (size < 0x40)                                  // room for the DOS header + e_lfanew
+                return;
             if (Marshal.ReadInt16(baseAddr) != 0x5A4D)        // 'MZ'
                 return;
             int elf = Marshal.ReadInt32((IntPtr)(b + 0x3C));
+            if (elf <= 0 || (long)elf + 248 > size)           // PE signature + COFF + (min) optional header must fit
+                return;
             if (Marshal.ReadInt32((IntPtr)(b + elf)) != 0x00004550)   // 'PE\0\0'
                 return;
 
@@ -149,14 +161,17 @@ namespace OutlookFileDrag
             long ordinalFlag = plus ? unchecked((long)0x8000000000000000) : 0x80000000L;
             long dataDir = opt + (plus ? 112 : 96);
 
+            if (dataDir + 112 - b > size)                     // the data directories we read (incl. [13]) must fit
+                return;
+
             // Normal imports (data directory[1]) and delay imports (data directory[13])
-            PatchTable(b, Marshal.ReadInt32((IntPtr)(dataDir + 1 * 8)), false, thunkSize, ordinalFlag);
-            PatchTable(b, Marshal.ReadInt32((IntPtr)(dataDir + 13 * 8)), true, thunkSize, ordinalFlag);
+            PatchTable(b, size, Marshal.ReadInt32((IntPtr)(dataDir + 1 * 8)), false, thunkSize, ordinalFlag);
+            PatchTable(b, size, Marshal.ReadInt32((IntPtr)(dataDir + 13 * 8)), true, thunkSize, ordinalFlag);
         }
 
-        private void PatchTable(long b, int dirRva, bool delay, int thunkSize, long ordinalFlag)
+        private void PatchTable(long b, long moduleSize, int dirRva, bool delay, int thunkSize, long ordinalFlag)
         {
-            if (dirRva == 0)
+            if (dirRva <= 0 || dirRva >= moduleSize)
                 return;
 
             int descSize = delay ? 32 : 20;
@@ -166,6 +181,9 @@ namespace OutlookFileDrag
 
             for (long d = b + dirRva; ; d += descSize)
             {
+                if ((d - b) + descSize > moduleSize)          // the whole descriptor must be in-bounds
+                    break;
+
                 int nameRva = Marshal.ReadInt32((IntPtr)(d + nameOff));
                 int intRva = Marshal.ReadInt32((IntPtr)(d + intOff));
                 int iatRva = Marshal.ReadInt32((IntPtr)(d + iatOff));
@@ -174,27 +192,37 @@ namespace OutlookFileDrag
                 if (delay) { if (nameRva == 0) break; }
                 else { if (nameRva == 0 && intRva == 0 && iatRva == 0) break; }
 
-                if (!StringEquals(b + nameRva, "ole32.dll"))
+                if (nameRva <= 0 || nameRva >= moduleSize || !StringEquals(b + nameRva, "ole32.dll", moduleSize, b))
                     continue;
 
                 // For normal imports OriginalFirstThunk may be 0 -> names live in FirstThunk
                 long names = (intRva != 0) ? intRva : iatRva;
+                if (names <= 0 || names >= moduleSize)
+                    continue;
 
                 for (int i = 0; ; i++)
                 {
+                    long nameSlot = names + (long)i * thunkSize;
+                    if (nameSlot + thunkSize > moduleSize)     // the thunk we read must be in-bounds
+                        break;
+
                     long entry = (thunkSize == 8)
-                        ? Marshal.ReadInt64((IntPtr)(b + names + i * 8))
-                        : (uint)Marshal.ReadInt32((IntPtr)(b + names + i * 4));
+                        ? Marshal.ReadInt64((IntPtr)(b + nameSlot))
+                        : (uint)Marshal.ReadInt32((IntPtr)(b + nameSlot));
                     if (entry == 0)
                         break;
                     if ((entry & ordinalFlag) != 0)
                         continue;                              // imported by ordinal -> no name
 
                     long ibnRva = entry & 0x7FFFFFFF;          // RVA of IMAGE_IMPORT_BY_NAME
-                    if (!StringEquals(b + ibnRva + 2, "DoDragDrop"))   // +2 skips the Hint
+                    if (ibnRva + 2 >= moduleSize || !StringEquals(b + ibnRva + 2, "DoDragDrop", moduleSize, b))   // +2 skips the Hint
                         continue;
 
-                    IntPtr slot = (IntPtr)(b + iatRva + i * thunkSize);
+                    long slotOffset = (long)iatRva + (long)i * thunkSize;
+                    if (slotOffset <= 0 || slotOffset + thunkSize > moduleSize)   // the IAT slot we patch must be in-bounds
+                        break;
+
+                    IntPtr slot = (IntPtr)(b + slotOffset);
                     PatchSlot(slot);
                 }
             }
@@ -230,8 +258,14 @@ namespace OutlookFileDrag
             }
         }
 
-        private static bool StringEquals(long addr, string expected)
+        // Compares a null-terminated ASCII string at an absolute address, but only after confirming the
+        // whole string + its terminator lie within the module (offset = addr - baseAddr is its RVA).
+        private static bool StringEquals(long addr, string expected, long moduleSize, long baseAddr)
         {
+            long offset = addr - baseAddr;
+            if (offset < 0 || offset + expected.Length + 1 > moduleSize)
+                return false;
+
             for (int i = 0; i < expected.Length; i++)
             {
                 byte ch = Marshal.ReadByte((IntPtr)(addr + i));
