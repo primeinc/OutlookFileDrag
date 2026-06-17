@@ -54,6 +54,11 @@ tag ver:
 compile-check:
     dotnet build ci/compile-check/OutlookFileDrag.Core.CompileCheck.csproj -c {{ CONFIGURATION }}
 
+# Run the portable interop-core unit tests (net8.0; runs on any OS incl. the Linux CI runner).
+[group('check')]
+test:
+    dotnet test tests/OutlookFileDrag.Core.Tests/OutlookFileDrag.Core.Tests.csproj -c {{ CONFIGURATION }}
+
 # --- Windows: build the VSTO add-in + WiX MSIs ----------------------------
 
 # Restore NuGet packages for the solution (packages.config needs nuget.exe, not
