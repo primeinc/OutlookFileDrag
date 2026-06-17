@@ -327,5 +327,8 @@ ASALocalRun/
 .tools/
 dist/
 
+# Generated from the MinVer git-tag version by `just build` (see justfile).
+OutlookFileDrag/Properties/VersionInfo.cs
+
 # Crash evidence collected during incidents (WER .wer/.mdmp -- contains customer data)
 CrashDumps/
