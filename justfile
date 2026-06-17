@@ -58,9 +58,13 @@ restore:
 build: restore
     #!pwsh
     $ErrorActionPreference = 'Stop'
-    $cert = New-SelfSignedCertificate -Type CodeSigningCert `
-        -Subject 'CN=OutlookFileDrag (Build)' -CertStoreLocation Cert:\CurrentUser\My `
-        -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
+    # Reuse an existing self-signed cert; don't mint one per build (store bloat).
+    $subject = 'CN=OutlookFileDrag (Build)'
+    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject } | Select-Object -First 1
+    if (-not $cert) {
+        $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject `
+            -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
+    }
     msbuild OutlookFileDrag\OutlookFileDrag.csproj /t:Build `
         /p:Configuration={{ CONFIGURATION }} /p:Platform=AnyCPU `
         /p:ManifestCertificateThumbprint=$($cert.Thumbprint) /v:m /nologo
