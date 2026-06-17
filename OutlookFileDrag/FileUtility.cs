@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Configuration;
 using System.IO;
 using System.Text.RegularExpressions;
@@ -48,12 +48,82 @@ namespace OutlookFileDrag
             }
         }
 
-        public static string GetUniqueFilename(string filename)
+        // Production entry point used by OutlookDataObject.ExtractFiles: reads the ReplaceSpecialChars
+        // policy from configuration once, then delegates to the testable, pure overload.
+        public static string GetContainedUniqueTarget(string tempRoot, string descriptorName)
+        {
+            bool replaceSpecialChars;
+            bool.TryParse(ConfigurationManager.AppSettings["ReplaceSpecialChars"], out replaceSpecialChars);
+            return GetContainedUniqueTarget(tempRoot, descriptorName, replaceSpecialChars);
+        }
+
+        // Canonical security boundary: turn an untrusted descriptor name into a unique file target
+        // GUARANTEED to live under tempRoot, or throw. Descriptor names can legitimately carry
+        // sub-path segments (folder drags) and maliciously carry traversal ("..\") or absolute/UNC
+        // paths; both are neutralized by reducing to a single leaf component, and a normalized-path
+        // containment check backstops it. This is the method the production write path calls, so it
+        // is also the method the path-containment tests pin.
+        internal static string GetContainedUniqueTarget(string tempRoot, string descriptorName, bool replaceSpecialChars)
+        {
+            string leaf = GetSafeLeafName(descriptorName, replaceSpecialChars);
+            string candidate = Path.Combine(tempRoot, leaf);
+
+            // Defense in depth: "../" is normalized by GetFullPath and Path.Combine does not contain,
+            // so verify the resolved path is rooted at tempRoot before any file is created. A leaf of
+            // "." or ".." (which carries no separator) is caught here.
+            string rootFull = Path.GetFullPath(tempRoot);
+            if (rootFull.Length == 0 || rootFull[rootFull.Length - 1] != Path.DirectorySeparatorChar)
+                rootFull += Path.DirectorySeparatorChar;
+            string candidateFull = Path.GetFullPath(candidate);
+            if (!candidateFull.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    string.Format("Refusing to extract '{0}': resolved path '{1}' is outside temp folder '{2}'",
+                        descriptorName, candidateFull, rootFull));
+
+            return GetUniqueFilename(candidateFull);
+        }
+
+        // Reduce a descriptor-supplied name to a single safe filename component. BOTH '/' and '\'
+        // are treated as separators regardless of host OS (descriptor names originate on Windows),
+        // and the final segment is taken -- NOT Path.GetFileName, which throws on ':' that legitimate
+        // subject-derived names contain. Optionally normalizes disallowed characters.
+        internal static string GetSafeLeafName(string descriptorName, bool replaceSpecialChars)
+        {
+            if (string.IsNullOrEmpty(descriptorName))
+                return "OutlookFileDrag";
+
+            int sep = descriptorName.LastIndexOfAny(new char[] { '\\', '/' });
+            string leaf = sep >= 0 ? descriptorName.Substring(sep + 1) : descriptorName;
+            if (string.IsNullOrEmpty(leaf))
+                leaf = "OutlookFileDrag";
+
+            if (!replaceSpecialChars)
+                return leaf;
+
+            int extIndex = leaf.LastIndexOf('.');
+            string justFilenameNoExt = extIndex >= 0 ? leaf.Substring(0, extIndex) : leaf;
+            string justExt = extIndex >= 0 ? leaf.Substring(extIndex) : string.Empty;
+
+            string justFilenameNoExtSimple = Regex.Replace(justFilenameNoExt, @"[^\p{L}\p{Nd}]+", "_").Trim('_');
+            if (string.IsNullOrEmpty(justFilenameNoExtSimple))
+                justFilenameNoExtSimple = "OutlookFileDrag";
+
+            //Replace invalid characters in extension as well
+            foreach (char invalidChar in Path.GetInvalidFileNameChars())
+                justExt = justExt.Replace(invalidChar, '_');
+
+            string sanitized = justFilenameNoExtSimple + justExt;
+            if (!string.Equals(leaf, sanitized, StringComparison.OrdinalIgnoreCase))
+                log.InfoFormat("Using {0} as CF_HDROP filename instead of {1}", sanitized, leaf);
+            return sanitized;
+        }
+
+        // Uniqueness + MAX_PATH truncation on an ALREADY-contained path. Does not sanitize names --
+        // that is GetSafeLeafName's job, applied before the path is combined with the temp root.
+        internal static string GetUniqueFilename(string filename)
         {
             string filenameNoExt;
             string ext;
-
-            filename = SanitizeFilename(filename);
 
             //If filename is too long, truncate filename
             if (filename.Length >= NativeMethods.MAX_PATH)
@@ -61,7 +131,7 @@ namespace OutlookFileDrag
                 ext = Path.GetExtension(filename);
                 filename = filename.Substring(0, NativeMethods.MAX_PATH - ext.Length - 1) + ext;
             }
-            
+
             //If file does not exist, use original filename
             if (!File.Exists(filename))
                 return filename;
@@ -86,38 +156,6 @@ namespace OutlookFileDrag
 
             //If no unique filename could be found, throw exception
             throw new Exception(string.Format("Could not generate unique filename for file {0}", filename));
-        }
-
-        private static string SanitizeFilename(string filename)
-        {
-            bool replaceSpecialChars;
-            if (!bool.TryParse(ConfigurationManager.AppSettings["ReplaceSpecialChars"], out replaceSpecialChars) || !replaceSpecialChars)
-                return filename;
-
-            //Split path and filename manually -- Path helpers validate the path and throw
-            //for characters such as ':' that descriptor names from message subjects can contain
-            int filenameIndex = filename.LastIndexOfAny(new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }) + 1;
-            string justPath = filename.Substring(0, filenameIndex);
-            string justFilename = filename.Substring(filenameIndex);
-
-            int extIndex = justFilename.LastIndexOf('.');
-            string justFilenameNoExt = extIndex >= 0 ? justFilename.Substring(0, extIndex) : justFilename;
-            string justExt = extIndex >= 0 ? justFilename.Substring(extIndex) : string.Empty;
-
-            string justFilenameNoExtSimple = Regex.Replace(justFilenameNoExt, @"[^\p{L}\p{Nd}]+", "_").Trim('_');
-
-            if (string.IsNullOrEmpty(justFilenameNoExtSimple))
-                justFilenameNoExtSimple = "OutlookFileDrag";
-
-            //Replace invalid characters in extension as well
-            foreach (char invalidChar in Path.GetInvalidFileNameChars())
-                justExt = justExt.Replace(invalidChar, '_');
-
-            string sanitizedFilename = justPath + justFilenameNoExtSimple + justExt;
-            if (!string.Equals(filename, sanitizedFilename, StringComparison.OrdinalIgnoreCase))
-                log.InfoFormat("Using {0} as CF_HDROP filename instead of {1}", sanitizedFilename, filename);
-
-            return sanitizedFilename;
         }
     }
 }

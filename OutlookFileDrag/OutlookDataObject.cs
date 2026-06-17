@@ -268,7 +268,7 @@ namespace OutlookFileDrag
             string[] extractedFilenames = new string[filenames.Length];
             for (int fileIndex = 0; fileIndex < filenames.Length; fileIndex++)
             {
-                extractedFilenames[fileIndex] = FileUtility.GetUniqueFilename(Path.Combine(tempPath, filenames[fileIndex]));
+                extractedFilenames[fileIndex] = FileUtility.GetContainedUniqueTarget(tempPath, filenames[fileIndex]);
                 log.DebugFormat("Extracting file {0}", filenames[fileIndex]);
                 using (FileStream fs = new FileStream(extractedFilenames[fileIndex], FileMode.Create))
                 {

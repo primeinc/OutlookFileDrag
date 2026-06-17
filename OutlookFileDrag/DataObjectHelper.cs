@@ -51,14 +51,24 @@ namespace OutlookFileDrag
             if (ptrDropFiles == IntPtr.Zero)
                 throw new OutOfMemoryException("GlobalAlloc failed for CF_HDROP medium");
 
-            //Copy DROPFILES structure to global memory.
-            Marshal.StructureToPtr(dropFiles, ptrDropFiles, true);
+            try
+            {
+                //Copy DROPFILES header.  fDeleteOld:false -- the block is freshly allocated and holds
+                //no previously-marshaled object to destroy.
+                Marshal.StructureToPtr(dropFiles, ptrDropFiles, false);
 
-            //Copy filenames to memory after DROPFILES structure
-            IntPtr ptrFiles = IntPtr.Add(ptrDropFiles, Marshal.SizeOf(dropFiles));
-            Marshal.Copy(filenameBytes, 0, ptrFiles, filenameBytes.Length);
-            
-            //Load structure into medium
+                //Copy filenames to memory after DROPFILES structure
+                IntPtr ptrFiles = IntPtr.Add(ptrDropFiles, Marshal.SizeOf(dropFiles));
+                Marshal.Copy(filenameBytes, 0, ptrFiles, filenameBytes.Length);
+            }
+            catch
+            {
+                //Construction failed before ownership transferred to the medium -- free our HGLOBAL.
+                NativeMethods.GlobalFree(ptrDropFiles);
+                throw;
+            }
+
+            //Load structure into medium only after all writes succeeded.
             medium.unionmember = ptrDropFiles;
             medium.tymed = TYMED.TYMED_HGLOBAL;
             medium.pUnkForRelease = null;        //HGLOBAL to be released by caller
@@ -126,6 +136,10 @@ namespace OutlookFileDrag
                 log.Debug("Marshaling unmanaged memory into FILEGROUPDESCRIPTORA struct");
                 NativeMethods.FILEGROUPDESCRIPTORA fgd = (NativeMethods.FILEGROUPDESCRIPTORA)Marshal.PtrToStructure(ptrFgd, typeof(NativeMethods.FILEGROUPDESCRIPTORA));
                 log.Debug(string.Format("Files found: {0}", fgd.cItems));
+
+                //Reject a descriptor whose item count cannot fit the medium we actually read, before
+                //walking fixed-size FILEDESCRIPTOR records past the buffer (an uncatchable AVE).
+                FileGroupDescriptor.ValidateCount(bytes.Length, Marshal.SizeOf(typeof(NativeMethods.FILEDESCRIPTORA)), fgd.cItems);
 
                 //Create an array to store file names
                 string[] filenames = new string[fgd.cItems];
@@ -209,6 +223,10 @@ namespace OutlookFileDrag
                 log.Debug("Marshaling unmanaged memory into FILEGROUPDESCRIPTORW struct");
                 NativeMethods.FILEGROUPDESCRIPTORW fgd = (NativeMethods.FILEGROUPDESCRIPTORW)Marshal.PtrToStructure(ptrFgd, typeof(NativeMethods.FILEGROUPDESCRIPTORW));
                 log.Debug(string.Format("Files found: {0}", fgd.cItems));
+
+                //Reject a descriptor whose item count cannot fit the medium we actually read, before
+                //walking fixed-size FILEDESCRIPTOR records past the buffer (an uncatchable AVE).
+                FileGroupDescriptor.ValidateCount(bytes.Length, Marshal.SizeOf(typeof(NativeMethods.FILEDESCRIPTORW)), fgd.cItems);
 
                 //Create an array to store file names
                 string[] filenames = new string[fgd.cItems];

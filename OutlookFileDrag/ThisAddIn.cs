@@ -10,6 +10,12 @@ namespace OutlookFileDrag
         private System.Threading.Timer cleanupTimer;
         private DragDropHook hook;
 
+        //Defaults applied when the App.config values are missing/malformed (matches the shipped
+        //App.config CleanupTimerInterval / TempFileExpiration = 60), so a bad config no longer
+        //aborts startup or silently disables interception.
+        private const int DefaultCleanupTimerIntervalMinutes = 60;
+        private const int DefaultTempFileExpirationMinutes = 60;
+
         private void ThisAddIn_Startup(object sender, System.EventArgs e)
         {
             //Configure logging
@@ -30,7 +36,9 @@ namespace OutlookFileDrag
                 AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
 
                 //Start cleanup timer
-                int cleanupTimerInterval = int.Parse(System.Configuration.ConfigurationManager.AppSettings["CleanupTimerInterval"]);
+                int cleanupTimerInterval;
+                if (!int.TryParse(System.Configuration.ConfigurationManager.AppSettings["CleanupTimerInterval"], out cleanupTimerInterval))
+                    cleanupTimerInterval = DefaultCleanupTimerIntervalMinutes;
                 log.InfoFormat("Starting cleanup timer -- run every {0} minutes", cleanupTimerInterval);
                 cleanupTimer = new System.Threading.Timer(CleanupTimer_Callback, null, 0, cleanupTimerInterval * 60 * 1000);
 
@@ -113,7 +121,9 @@ namespace OutlookFileDrag
         {
             try
             {
-                int tempFileExpiration = int.Parse(System.Configuration.ConfigurationManager.AppSettings["TempFileExpiration"]);
+                int tempFileExpiration;
+                if (!int.TryParse(System.Configuration.ConfigurationManager.AppSettings["TempFileExpiration"], out tempFileExpiration))
+                    tempFileExpiration = DefaultTempFileExpirationMinutes;
                 log.InfoFormat("Cleaning up temp files older than {0} minutes", tempFileExpiration);
                 FileUtility.CleanupTempPath(tempFileExpiration);
             }
