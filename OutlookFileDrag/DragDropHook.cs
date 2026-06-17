@@ -1,38 +1,42 @@
-﻿using System;
-using EasyHook;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using log4net;
 
 namespace OutlookFileDrag
 {
+    // Redirects calls to ole32!DoDragDrop by overwriting the import / delay-import address-table
+    // slot in every loaded module that imports it, instead of inline-patching ole32's code.
+    //
+    // Why: Office 16.0.20131+ (Current Channel Preview) also intercepts ole32!DoDragDrop via
+    // AppVIsvSubsystems64.dll. The previous approach (EasyHook) wrote a JMP into ole32's code; two
+    // inline patches over the same prologue corrupt the heap and fastfail OUTLOOK.EXE (0xC0000409,
+    // subcode 0x23) on every drag. An IAT redirect lives in the *caller's import table*, not in
+    // ole32's code, so it cannot collide with Office's patch -- they occupy different memory.
+    // Verified on this build: only OUTLOOK.EXE imports DoDragDrop, via a delay-load thunk.
     class DragDropHook : IDisposable
     {
         private static ILog log = LogManager.GetLogger(System.Reflection.MethodBase.GetCurrentMethod().DeclaringType);
-        private LocalHook hook;
+
+        private readonly NativeMethods.DragDropDelegate detour;
+        private readonly IntPtr detourPtr;
+        private readonly List<Patch> patches = new List<Patch>();
         private bool disposed = false;
         private bool isHooked = false;
 
+        private struct Patch { public IntPtr Slot; public IntPtr Original; }
+
         public DragDropHook()
         {
-            try
-            {
-                //Hook OLE drag and drop event
-                log.Info("Creating hook for DoDragDrop method of ole32.dll");
-                hook = EasyHook.LocalHook.Create(EasyHook.LocalHook.GetProcAddress("ole32.dll", "DoDragDrop"),
-                    new NativeMethods.DragDropDelegate(DragDropHook.DoDragDropHook), null);
-            }
-            catch (Exception ex)
-            {
-                log.Error("Error creating hook", ex);
-                throw;
-            }
+            // Keep the delegate referenced for the life of the hook so its native thunk stays valid.
+            detour = new NativeMethods.DragDropDelegate(DoDragDropHook);
+            detourPtr = Marshal.GetFunctionPointerForDelegate(detour);
         }
 
         public bool IsHooked
         {
-            get
-            {
-                return isHooked;
-            }
+            get { return isHooked; }
         }
 
         public void Start()
@@ -42,14 +46,29 @@ namespace OutlookFileDrag
                 if (isHooked)
                     return;
 
-                log.Info("Starting hook");
-                //Hook current (UI) thread
-                hook.ThreadACL.SetInclusiveACL(new Int32[] { 0 });
+                log.Info("Installing DoDragDrop import redirect");
+                foreach (ProcessModule module in Process.GetCurrentProcess().Modules)
+                {
+                    try
+                    {
+                        PatchModule(module);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.DebugFormat("Skipped module at {0}: {1}", module.BaseAddress, ex.Message);
+                    }
+                }
+
+                if (patches.Count == 0)
+                    log.Warn("No ole32!DoDragDrop import slot found -- drag interception is INACTIVE");
+                else
+                    log.InfoFormat("Redirected {0} ole32!DoDragDrop import slot(s)", patches.Count);
+
                 isHooked = true;
             }
             catch (Exception ex)
             {
-                log.Error("Error starting hook", ex);
+                log.Error("Error installing import redirect", ex);
                 throw;
             }
         }
@@ -61,15 +80,19 @@ namespace OutlookFileDrag
                 if (!isHooked)
                     return;
 
-                log.Info("Stopping hook");
-                //Stop hooking all threads
-                hook.ThreadACL.SetInclusiveACL(new Int32[] { });
+                log.Info("Removing DoDragDrop import redirect");
+                foreach (Patch p in patches)
+                {
+                    try { WriteSlot(p.Slot, p.Original); }
+                    catch (Exception ex) { log.WarnFormat("Could not restore slot {0}: {1}", p.Slot, ex.Message); }
+                }
+                patches.Clear();
                 isHooked = false;
-                log.Info("Stopped hook");
+                log.Info("Removed import redirect");
             }
             catch (Exception ex)
             {
-                log.Error("Error stopping hook", ex);
+                log.Error("Error removing import redirect", ex);
                 throw;
             }
         }
@@ -108,6 +131,156 @@ namespace OutlookFileDrag
             }
         }
 
+        // --- Import-table patching ------------------------------------------------------------
+
+        // Parse the module's PE import / delay-import tables to find ole32!DoDragDrop slots. Every RVA
+        // is validated against the module's mapped size (module.ModuleMemorySize) before it is read:
+        // a corrupted header, a truncated module, or one rewritten by security software must NOT cause
+        // an out-of-bounds read -> AccessViolationException is uncatchable and would fastfail OUTLOOK.EXE,
+        // the exact crash class this add-in exists to prevent.
+        private void PatchModule(ProcessModule module)
+        {
+            IntPtr baseAddr = module.BaseAddress;
+            long b = baseAddr.ToInt64();
+            long size = module.ModuleMemorySize;
+
+            if (size < 0x40)                                  // room for the DOS header + e_lfanew
+                return;
+            if (Marshal.ReadInt16(baseAddr) != 0x5A4D)        // 'MZ'
+                return;
+            int elf = Marshal.ReadInt32((IntPtr)(b + 0x3C));
+            if (elf <= 0 || (long)elf + 248 > size)           // PE signature + COFF + (min) optional header must fit
+                return;
+            if (Marshal.ReadInt32((IntPtr)(b + elf)) != 0x00004550)   // 'PE\0\0'
+                return;
+
+            long opt = b + elf + 24;
+            short magic = Marshal.ReadInt16((IntPtr)opt);
+            if (magic != 0x10B && magic != 0x20B)             // only PE32 (0x10B) or PE32+ (0x20B); anything else is an unknown layout
+                return;
+            bool plus = magic == 0x20B;                       // PE32+ (x64); else PE32 (x86)
+            int thunkSize = plus ? 8 : 4;
+            long ordinalFlag = plus ? unchecked((long)0x8000000000000000) : 0x80000000L;
+            long dataDir = opt + (plus ? 112 : 96);
+
+            if (dataDir + 112 - b > size)                     // the data directories we read (incl. [13]) must fit
+                return;
+
+            // Normal imports (data directory[1]) and delay imports (data directory[13])
+            PatchTable(b, size, Marshal.ReadInt32((IntPtr)(dataDir + 1 * 8)), false, thunkSize, ordinalFlag);
+            PatchTable(b, size, Marshal.ReadInt32((IntPtr)(dataDir + 13 * 8)), true, thunkSize, ordinalFlag);
+        }
+
+        private void PatchTable(long b, long moduleSize, int dirRva, bool delay, int thunkSize, long ordinalFlag)
+        {
+            if (dirRva <= 0 || dirRva >= moduleSize)
+                return;
+
+            int descSize = delay ? 32 : 20;
+            int nameOff = delay ? 4 : 12;     // RVA of imported DLL name
+            int intOff = delay ? 16 : 0;      // RVA of Import Name Table (names)
+            int iatOff = delay ? 12 : 16;     // RVA of Import Address Table (slots to patch)
+
+            for (long d = b + dirRva; ; d += descSize)
+            {
+                if ((d - b) + descSize > moduleSize)          // the whole descriptor must be in-bounds
+                    break;
+
+                int nameRva = Marshal.ReadInt32((IntPtr)(d + nameOff));
+                int intRva = Marshal.ReadInt32((IntPtr)(d + intOff));
+                int iatRva = Marshal.ReadInt32((IntPtr)(d + iatOff));
+
+                // Terminator: import = all-zero descriptor; delay = null DLL name
+                if (delay) { if (nameRva == 0) break; }
+                else { if (nameRva == 0 && intRva == 0 && iatRva == 0) break; }
+
+                if (nameRva <= 0 || nameRva >= moduleSize || !StringEquals(b + nameRva, "ole32.dll", moduleSize, b))
+                    continue;
+
+                // For normal imports OriginalFirstThunk may be 0 -> names live in FirstThunk
+                long names = (intRva != 0) ? intRva : iatRva;
+                if (names <= 0 || names >= moduleSize)
+                    continue;
+
+                for (int i = 0; ; i++)
+                {
+                    long nameSlot = names + (long)i * thunkSize;
+                    if (nameSlot + thunkSize > moduleSize)     // the thunk we read must be in-bounds
+                        break;
+
+                    long entry = (thunkSize == 8)
+                        ? Marshal.ReadInt64((IntPtr)(b + nameSlot))
+                        : (uint)Marshal.ReadInt32((IntPtr)(b + nameSlot));
+                    if (entry == 0)
+                        break;
+                    if ((entry & ordinalFlag) != 0)
+                        continue;                              // imported by ordinal -> no name
+
+                    long ibnRva = entry & ~ordinalFlag;        // RVA of IMAGE_IMPORT_BY_NAME (clear only the ordinal flag -- RVA bit 31 is significant on PE32+)
+                    if (ibnRva + 2 >= moduleSize || !StringEquals(b + ibnRva + 2, "DoDragDrop", moduleSize, b))   // +2 skips the Hint
+                        continue;
+
+                    long slotOffset = (long)iatRva + (long)i * thunkSize;
+                    if (slotOffset <= 0 || slotOffset + thunkSize > moduleSize)   // the IAT slot we patch must be in-bounds
+                        break;
+
+                    IntPtr slot = (IntPtr)(b + slotOffset);
+                    PatchSlot(slot);
+                }
+            }
+        }
+
+        private void PatchSlot(IntPtr slot)
+        {
+            foreach (Patch existing in patches)
+                if (existing.Slot == slot)
+                    return;
+
+            IntPtr original = Marshal.ReadIntPtr(slot);
+            if (original == detourPtr)
+                return;
+
+            WriteSlot(slot, detourPtr);
+            patches.Add(new Patch { Slot = slot, Original = original });
+        }
+
+        private static void WriteSlot(IntPtr slot, IntPtr value)
+        {
+            uint old;
+            if (!NativeMethods.VirtualProtect(slot, (IntPtr)IntPtr.Size, NativeMethods.PAGE_READWRITE, out old))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            try
+            {
+                Marshal.WriteIntPtr(slot, value);
+            }
+            finally
+            {
+                uint ignore;
+                NativeMethods.VirtualProtect(slot, (IntPtr)IntPtr.Size, old, out ignore);
+            }
+        }
+
+        // Compares a null-terminated ASCII string at an absolute address, but only after confirming the
+        // whole string + its terminator lie within the module (offset = addr - baseAddr is its RVA).
+        private static bool StringEquals(long addr, string expected, long moduleSize, long baseAddr)
+        {
+            long offset = addr - baseAddr;
+            if (offset < 0 || offset + expected.Length + 1 > moduleSize)
+                return false;
+
+            for (int i = 0; i < expected.Length; i++)
+            {
+                byte ch = Marshal.ReadByte((IntPtr)(addr + i));
+                if (ch == 0)
+                    return false;
+                // case-insensitive ASCII compare
+                char c = (char)ch;
+                if (char.ToUpperInvariant(c) != char.ToUpperInvariant(expected[i]))
+                    return false;
+            }
+            return Marshal.ReadByte((IntPtr)(addr + expected.Length)) == 0;
+        }
+
         public void Dispose()
         {
             Dispose(true);
@@ -121,11 +294,10 @@ namespace OutlookFileDrag
 
             if (disposing)
             {
-                hook.Dispose();
+                Stop();
             }
 
             disposed = true;
         }
     }
-
 }
