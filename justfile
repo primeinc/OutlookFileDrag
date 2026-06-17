@@ -6,9 +6,13 @@
 # message. The interop-core `compile-check` builds on any OS via `dotnet build`.
 #
 # Run the Windows recipes from a "Developer PowerShell for VS 2022" (which puts
-# `msbuild` and `nuget` on PATH); CI provisions the same tools via
-# microsoft/setup-msbuild + NuGet/setup-nuget + actions/setup-dotnet and then
-# calls these same recipes (see .github/workflows/build-windows.yml).
+# `msbuild` on PATH). Visual Studio does NOT ship a standalone `nuget.exe`; the
+# `restore` recipe installs Microsoft's portable nuget.exe via winget the first
+# time it isn't already on PATH (falling back to a direct download only where
+# winget is unavailable), so a clean dev box builds with no manual setup. CI
+# provides msbuild + nuget + dotnet via microsoft/setup-msbuild + NuGet/setup-nuget
+# + actions/setup-dotnet and then calls these same recipes (see
+# .github/workflows/build-windows.yml).
 
 # Keep in sync with installer/OutlookFileDrag.wxs (?define Version default).
 VERSION := "1.0.13"
@@ -41,7 +45,41 @@ compile-check:
 [group('build')]
 [windows]
 restore:
-    nuget restore OutlookFileDrag.sln
+    #!pwsh
+    $ErrorActionPreference = 'Stop'
+    # packages.config restore needs nuget.exe (not `dotnet restore`, which only
+    # understands PackageReference). Use one already on PATH (e.g. CI's
+    # NuGet/setup-nuget); otherwise install Microsoft's portable nuget.exe via
+    # winget so a clean dev box restores with no manual download.
+    $nuget = (Get-Command nuget.exe -ErrorAction SilentlyContinue).Source
+    if (-not $nuget) {
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host 'nuget.exe not on PATH; installing Microsoft.NuGet via winget...'
+            winget install -e --id Microsoft.NuGet --accept-source-agreements --accept-package-agreements --disable-interactivity
+            # winget shims portables into %LOCALAPPDATA%\Microsoft\WinGet\Links;
+            # that dir is only on PATH for *new* sessions, so resolve it directly.
+            $links = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\nuget.exe'
+            if (Test-Path $links) {
+                $nuget = $links
+            } else {
+                $pkgs = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+                $nuget = (Get-ChildItem $pkgs -Recurse -Filter nuget.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+            }
+        }
+        if (-not $nuget) {
+            # No winget (e.g. minimal box): fetch the same official build winget would.
+            $cache = Join-Path $env:LOCALAPPDATA 'OutlookFileDrag\tools'
+            $nuget = Join-Path $cache 'nuget.exe'
+            if (-not (Test-Path $nuget)) {
+                New-Item -ItemType Directory -Force $cache | Out-Null
+                Write-Host "winget unavailable; downloading nuget.exe -> $nuget"
+                Invoke-WebRequest 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe' -OutFile $nuget -UseBasicParsing
+            }
+        }
+    }
+    if (-not $nuget) { throw 'could not locate or install nuget.exe' }
+    & $nuget restore OutlookFileDrag.sln
+    if ($LASTEXITCODE -ne 0) { throw "nuget restore failed (exit $LASTEXITCODE)" }
 
 [group('build')]
 [unix]
