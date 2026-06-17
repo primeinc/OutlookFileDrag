@@ -42,6 +42,7 @@ compile-check:
 
 # Restore NuGet packages for the solution (packages.config needs nuget.exe, not
 # `dotnet restore`).
+[doc('Restore NuGet packages (bootstraps nuget.exe if absent)')]
 [group('build')]
 [windows]
 restore:
@@ -91,6 +92,7 @@ restore:
 # not the cert identity (see docs/AUDIT-IAT-REDIRECT.md), so a self-signed cert
 # is correct here. Cert + build run in one shebang script so the thumbprint
 # persists between the two steps.
+[doc('Build + sign the VSTO add-in (MSBuild)')]
 [group('build')]
 [windows]
 build: restore
@@ -115,6 +117,7 @@ build:
 
 # Build the add-in then both (x86 + x64) MSIs with WiX (e.g. `just msi 1.0.13`).
 # Depends on `build`, so it works end-to-end on a clean tree.
+[doc('Build the add-in, then the x86 + x64 MSIs')]
 [group('release')]
 [windows]
 msi version=VERSION: build
@@ -140,6 +143,7 @@ msi version=VERSION:
 
 # Full release: the add-in + both MSIs (e.g. `just release 1.0.13`). `msi`
 # already depends on `build`, so this is the friendly name CI invokes.
+[doc('Build the add-in + both MSIs (CI entry point)')]
 [group('release')]
 [windows]
 release version=VERSION: (msi version)
@@ -153,6 +157,7 @@ release version=VERSION:
 
 # Remove build output (asks for confirmation; CI passes --yes).
 [confirm("Delete dist/, OutlookFileDrag/bin, OutlookFileDrag/obj. Continue?")]
+[doc('Remove build output (dist/, bin/, obj/)')]
 [group('maintenance')]
 [windows]
 clean:
