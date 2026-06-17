@@ -33,6 +33,9 @@ using System.Security;
 // You can specify all the values or you can default the Build and Revision Numbers 
 // by using the '*' as shown below:
 // [assembly: AssemblyVersion("1.0.*")]
-[assembly: AssemblyVersion("1.0.13.0")]
-[assembly: AssemblyFileVersion("1.0.13.0")]
+//
+// AssemblyVersion / AssemblyFileVersion / AssemblyInformationalVersion are now
+// generated into Properties/VersionInfo.cs by `just build`, from the MinVer-derived
+// git-tag version (see the justfile). VersionInfo.cs is git-ignored and compiled
+// only when present, so a bare build without it still succeeds (version 0.0.0.0).
 

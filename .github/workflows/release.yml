@@ -3,6 +3,10 @@ name: Release
 # On a pushed v* tag: build the add-in + MSIs on Windows (reusing build-windows),
 # then publish a GitHub Release with the MSIs attached, using the first-party
 # GitHub CLI (`gh release create`), which is preinstalled on the runner.
+#
+# The version is not threaded through here: MinVer derives it from the tag inside
+# the build recipes (build-windows checks out with fetch-depth: 0), so a `v1.0.14`
+# tag yields MSIs versioned 1.0.14 with no string-munging.
 
 on:
   push:
@@ -12,28 +16,16 @@ permissions:
   contents: write          # required to create the release / upload assets
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.v.outputs.version }}
-    steps:
-      # Strip the leading 'v' from the tag (v1.0.14 -> 1.0.14) for the MSI version.
-      - id: v
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
   build:
-    needs: prepare
     uses: ./.github/workflows/build-windows.yml
-    with:
-      version: ${{ needs.prepare.outputs.version }}
 
   publish:
-    needs: [prepare, build]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: msi-${{ needs.prepare.outputs.version }}
+          name: msi
           path: dist
 
       - name: Create GitHub Release

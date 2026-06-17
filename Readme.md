@@ -58,26 +58,41 @@ locally and in CI. List them with `just`:
 
 | Recipe | Platform | What it does |
 | --- | --- | --- |
+| `just version` | any OS | Print the MinVer-derived version (from git tags). |
 | `just compile-check` | any OS | `dotnet build` of the platform-independent interop core (`ci/compile-check/`) — a fast compile gate, no Visual Studio. |
-| `just build` | Windows | Builds the VSTO add-in with MSBuild (signs the ClickOnce manifest with an ephemeral self-signed cert). |
-| `just msi <version>` | Windows | Builds the x86 + x64 MSIs with WiX into `dist/`. |
-| `just release <version>` | Windows | `build` then `msi` — the full set of artifacts. |
+| `just build` | Windows | Builds the VSTO add-in with MSBuild (signs the ClickOnce manifest with an ephemeral self-signed cert), version-stamped from MinVer. |
+| `just msi [version]` | Windows | Builds the x86 + x64 MSIs with WiX into `dist/` (version from MinVer unless one is given). |
+| `just release [version]` | Windows | `build` then `msi` — the full set of artifacts. |
+| `just tag <version>` | any OS | Create + push an annotated `v<version>` tag, triggering a release. |
 
 **Prerequisites**
 
 - [`just`](https://just.systems/man/en/installation.html) — `winget install Casey.Just` / `choco install just` (Windows), `brew install just` / `apt install just` (macOS/Linux).
 - The [.NET SDK](https://dotnet.microsoft.com/download) (6.0+) — for `compile-check` and for the pinned WiX tool (`.config/dotnet-tools.json`, restored with `dotnet tool restore`).
-- **For the Windows add-in + MSI build only:** Visual Studio 2022 with the *Office/SharePoint development* workload (the VSTO build targets are Windows/VS-only and absent from the .NET SDK), PowerShell 7 (`pwsh`), and `nuget.exe` on `PATH` — easiest from a *Developer PowerShell for VS 2022*.
+- **For the Windows add-in + MSI build only:** Visual Studio 2022 with the *Office/SharePoint development* workload (the VSTO build targets are Windows/VS-only and absent from the .NET SDK) and PowerShell 7 (`pwsh`), run from a *Developer PowerShell for VS 2022* so `msbuild` is on `PATH`. (`restore` bootstraps `nuget.exe` itself — via winget, or a pinned, SHA-256-verified download — since Visual Studio doesn't ship one.)
 
 WiX is pinned to v7 via `.config/dotnet-tools.json`. The recipes pass
 `-acceptEula wix7` to every `wix` command so the build is non-interactive
 (accepting the WiX Open-Source Maintenance Fee EULA is free for non-revenue use).
 
+**Versioning**
+
+The version is derived from git tags by [MinVer](https://github.com/adamralph/minver)
+(`minver-cli`, pinned in `.config/dotnet-tools.json`) — nothing is hardcoded in the
+repo. An annotated tag `v1.2.3` yields version `1.2.3`; commits after a tag yield
+`1.2.4-alpha.0.N`. It flows to the MSI `ProductVersion` (numeric `major.minor.patch`)
+and to the assembly (`AssemblyVersion`/`FileVersion`/`InformationalVersion`, generated
+into the git-ignored `OutlookFileDrag/Properties/VersionInfo.cs` by `just build`).
+
+- Print the current version: `just version`.
+- Cut a release: `just tag 1.2.3` (creates + pushes `v1.2.3`, triggering `release.yml`).
+- One-time baseline — this fork has no version tags yet, so anchor MinVer by tagging the
+  current state once, e.g. `just tag 1.0.13`; until then builds report `1.0.0-alpha.0.N`.
+
 **CI / releases** (`.github/workflows/`)
 
 - `ci.yml` — the Linux `compile-check` on every push/PR; the full Windows add-in + MSI build (`build-windows.yml`, on `windows-2022`) on pushes to `master` / `release/**` only (gated off PRs to keep them fast). Release tags are covered by `release.yml`.
-- `release.yml` — on a pushed `v*` tag: builds the MSIs and publishes a GitHub Release with them attached.
-- `stale-branches.yml` — scheduled cleanup of merged branches.
+- `release.yml` — on a pushed `v*` tag: builds the MSIs (version derived from the tag by MinVer) and publishes a GitHub Release with them attached.
 
 ## Installation
 

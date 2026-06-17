@@ -2,7 +2,9 @@ name: build-windows
 
 # Reusable Windows build. Provisions first-party tools, then runs the SAME `just`
 # recipes a developer runs locally (the justfile is the single source of build
-# truth -- this workflow contains no build logic of its own).
+# truth -- this workflow contains no build logic of its own). The version is
+# derived from git tags by MinVer inside the recipes, which is why checkout uses
+# fetch-depth: 0.
 #
 # Runs on windows-2022 because the VSTO add-in needs full MSBuild with the
 # "Office/SharePoint development" workload, which ships in that runner image
@@ -11,11 +13,6 @@ name: build-windows
 
 on:
   workflow_call:
-    inputs:
-      version:
-        description: 'MSI ProductVersion (numeric, no leading v).'
-        type: string
-        default: '1.0.13'
 
 jobs:
   build:
@@ -26,7 +23,10 @@ jobs:
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       DOTNET_NOLOGO: '1'
     steps:
+      # Full history + tags so MinVer can derive the version (it needs depth).
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-dotnet@v5
         with:
@@ -44,12 +44,13 @@ jobs:
       - name: Install just
         run: choco install just --yes --no-progress
 
-      # build (add-in) -> msi (x86 + x64). Identical to local `just release <ver>`.
+      # build (add-in) -> msi (x86 + x64). The version is derived from the git tag
+      # by MinVer. Identical to local `just release`.
       - name: Build add-in + MSIs
-        run: just release ${{ inputs.version }}
+        run: just release
 
       - uses: actions/upload-artifact@v7
         with:
-          name: msi-${{ inputs.version }}
+          name: msi
           path: dist/*.msi
           if-no-files-found: error
