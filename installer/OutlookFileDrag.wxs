@@ -21,8 +21,8 @@
     ProductCode is "*" below: WiX auto-generates a fresh GUID every build, so the
     MajorUpgrade reliably removes the previously-installed build first, with no manual
     GUID bump per release (which is what caused the MSI 1638 between 1.0.12 builds).
-    Version flows in from build.ps1 via `-d Version=...`; the ifndef gives a default
-    so a bare `wix build` still works. Bump it by changing build.ps1 -Version only.
+    Version flows in from `just msi <version>` (or `just release <version>`) via
+    `-d Version=...`; the ifndef gives a default so a bare `wix build` still works.
   -->
   <?ifndef Version ?><?define Version = "1.0.13" ?><?endif?>
   <?if $(sys.BUILDARCH) = x64 ?>
