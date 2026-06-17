@@ -1,13 +1,10 @@
 name: CI
 
-# Compile-gate the platform-independent interop core on Linux.
-#
-# The full VSTO add-in + MSI are Windows-only (VSTO is .NET Framework + Visual
-# Studio only per Microsoft Learn) and are built with build.ps1 on Windows.
-# Everything with the audit-critical native code (IAT redirect, PE/import-table
-# walking, P/Invoke, OLE data object) has no Microsoft.Office.* dependency, so it
-# compiles cross-platform via the net472 reference assemblies -- no Windows
-# runner, no Visual Studio, no PowerShell required to catch a broken build.
+# PR/push gate, two jobs:
+#  - compile-check: the platform-independent interop core, built on Linux (fast;
+#    catches breakage in the audit-critical native code with no Windows runner).
+#  - build-windows: the full VSTO add-in + WiX MSIs, built on Windows via the
+#    reusable build-windows workflow (which runs the justfile recipes).
 
 on:
   push:
@@ -22,14 +19,18 @@ jobs:
     name: Interop core compile check (Linux)
     runs-on: ubuntu-latest
     env:
-      DOTNET_CLI_TELEMETRY_OPTOUT: 1
-      DOTNET_NOLOGO: 1
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
 
       - name: Build interop core (net472 via reference assemblies)
         run: dotnet build ci/compile-check/OutlookFileDrag.Core.CompileCheck.csproj -c Release
+
+  build-windows:
+    name: Add-in + MSIs (Windows)
+    uses: ./.github/workflows/build-windows.yml

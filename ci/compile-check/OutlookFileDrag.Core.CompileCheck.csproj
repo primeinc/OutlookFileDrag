@@ -15,7 +15,7 @@
     with no Visual Studio, no Windows runner, and no PowerShell.
 
     It produces no shipping artifact; it is a compile gate only. The real
-    add-in + MSI are still built on Windows (see build.ps1).
+    add-in + MSI are still built on Windows (see the justfile: `just release`).
   -->
 
   <PropertyGroup>

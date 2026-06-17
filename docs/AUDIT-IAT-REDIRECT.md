@@ -207,7 +207,9 @@ exactly those files against the net472 reference assemblies, so
 `dotnet build` verifies the interop core on Linux (and any OS) with no Visual
 Studio, no Windows runner, and no PowerShell. The `.github/workflows/ci.yml`
 GitHub Actions job runs it on every push/PR. The Windows-only add-in + MSI build
-remains `build.ps1`.
+is driven by the `justfile` (`just build` / `just msi` / `just release`),
+reused by the `build-windows` / `release` workflows; WiX is pinned via
+`.config/dotnet-tools.json`.
 
 Dependency audit: the compile check runs NuGet's vulnerability audit with
 warnings treated as errors (`TreatWarningsAsErrors` + `NuGetAuditMode=all`,

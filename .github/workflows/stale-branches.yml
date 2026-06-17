@@ -1,0 +1,46 @@
+name: Prune stale branches
+
+# Delete branches whose pull request has already been merged, and turn on the
+# repo's "automatically delete head branches" setting so future merged PR
+# branches self-clean. Uses only the first-party GitHub CLI / REST API.
+#
+# Safety: never the default branch, never a protected branch, never a fork's
+# branch, and only branches tied to an already-merged PR.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write          # deleting a branch ref is a contents write
+  pull-requests: read
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      # `-F` sends a typed JSON boolean (true); `-f` would send the string "true".
+      - name: Enable auto-delete of merged PR head branches
+        run: gh api -X PATCH "repos/$REPO" -F delete_branch_on_merge=true
+
+      - name: Delete merged PR head branches (skip default / protected / forks)
+        run: |
+          set -euo pipefail
+          owner="${REPO%/*}"
+          default="$(gh api "repos/$REPO" --jq .default_branch)"
+          gh pr list --repo "$REPO" --state merged --limit 200 \
+            --json headRefName,headRepositoryOwner \
+            --jq ".[] | select(.headRepositoryOwner.login == \"$owner\") | .headRefName" \
+          | sort -u | while read -r b; do
+              [ -z "$b" ] && continue
+              [ "$b" = "$default" ] && continue
+              prot="$(gh api "repos/$REPO/branches/$b" --jq .protected 2>/dev/null || echo missing)"
+              [ "$prot" = "missing" ] && continue            # branch already gone
+              [ "$prot" = "true" ] && { echo "skip protected: $b"; continue; }
+              echo "deleting: $b"
+              gh api -X DELETE "repos/$REPO/git/refs/heads/$b"
+            done
