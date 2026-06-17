@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  OutlookFileDrag installer (WiX v5/v6).
+  OutlookFileDrag installer (WiX v7).
 
   Replaces the legacy Visual Studio Deployment Projects
   (OutlookFileDragSetup / OutlookFileDragSetup_x64). One shared source builds
@@ -66,7 +66,7 @@
         Condition="Installed OR WIX_IS_NETFRAMEWORK_472_OR_LATER_INSTALLED"
         Message="This application requires .NET Framework 4.7.2 or later. Please install it and run setup again." />
 
-    <!-- [ProgramFiles*]\Tony Federer\Outlook File Drag -->
+    <!-- [ProgramFiles*]\4pp\Outlook File Drag -->
     <StandardDirectory Id="$(PlatformProgramFiles)">
       <Directory Id="MfrFolder" Name="4pp">
         <Directory Id="INSTALLFOLDER" Name="Outlook File Drag" />
