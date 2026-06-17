@@ -68,13 +68,22 @@ restore:
             }
         }
         if (-not $nuget) {
-            # No winget (e.g. minimal box): fetch the same official build winget would.
+            # No winget (e.g. minimal box): fetch from the IMMUTABLE versioned URL,
+            # pinned + SHA-256 verified (matches the original build.ps1; `.../latest/`
+            # is mutable and can't be hash-checked).
+            $nugetVersion = '6.11.0'
+            $nugetSha256  = '133B9C1EFDC8D86BDCCAE9E296C9E4BC45A6D6472368611AA96B51B3E75FD2E3'
             $cache = Join-Path $env:LOCALAPPDATA 'OutlookFileDrag\tools'
             $nuget = Join-Path $cache 'nuget.exe'
             if (-not (Test-Path $nuget)) {
                 New-Item -ItemType Directory -Force $cache | Out-Null
-                Write-Host "winget unavailable; downloading nuget.exe -> $nuget"
-                Invoke-WebRequest 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe' -OutFile $nuget -UseBasicParsing
+                Write-Host "winget unavailable; downloading nuget.exe $nugetVersion -> $nuget"
+                Invoke-WebRequest "https://dist.nuget.org/win-x86-commandline/v$nugetVersion/nuget.exe" -OutFile $nuget -UseBasicParsing
+            }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $nuget).Hash
+            if ($actual -ne $nugetSha256) {
+                Remove-Item -LiteralPath $nuget -Force -ErrorAction SilentlyContinue
+                throw "nuget.exe $nugetVersion SHA-256 mismatch: expected $nugetSha256, got $actual"
             }
         }
     }
@@ -101,7 +110,7 @@ build: restore
     $PSNativeCommandUseErrorActionPreference = $true   # msbuild non-zero exit => terminating
     # Reuse an existing self-signed cert; don't mint one per build (store bloat).
     $subject = 'CN=OutlookFileDrag (Build)'
-    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject } | Select-Object -First 1
+    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date) } | Sort-Object NotAfter -Descending | Select-Object -First 1
     if (-not $cert) {
         $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject `
             -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)

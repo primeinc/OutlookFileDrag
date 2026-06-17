@@ -75,7 +75,7 @@ WiX is pinned to v7 via `.config/dotnet-tools.json`. The recipes pass
 
 **CI / releases** (`.github/workflows/`)
 
-- `ci.yml` — on every push/PR: the Linux `compile-check` plus the full Windows add-in + MSI build (`build-windows.yml`, on `windows-2022`).
+- `ci.yml` — the Linux `compile-check` on every push/PR; the full Windows add-in + MSI build (`build-windows.yml`, on `windows-2022`) on pushes to `master` / `release/**` only (gated off PRs to keep them fast). Release tags are covered by `release.yml`.
 - `release.yml` — on a pushed `v*` tag: builds the MSIs and publishes a GitHub Release with them attached.
 - `stale-branches.yml` — scheduled cleanup of merged branches.
 
