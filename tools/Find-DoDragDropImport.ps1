@@ -50,7 +50,7 @@ function Test-PeImportsFunc {
             $entry = U64 $t
             if ($entry -eq 0) { break }
             if (($entry -band 0x8000000000000000) -eq 0) {
-                $o = RvaToOff ([uint32]($entry -band 0x7FFFFFFF))
+                $o = RvaToOff ([uint32]($entry -band 0xFFFFFFFFL))   # bit 63 (ordinal) already ruled out above -> the low 32 bits are the RVA
                 if ($o -ge 0) { $fn = AsciiZ ($o + 2); if ($fn -ieq $Func) { $script:hits += "$dll ($kind)" } }
             }
             $t += 8

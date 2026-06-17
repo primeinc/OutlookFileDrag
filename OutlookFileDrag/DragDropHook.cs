@@ -156,6 +156,8 @@ namespace OutlookFileDrag
 
             long opt = b + elf + 24;
             short magic = Marshal.ReadInt16((IntPtr)opt);
+            if (magic != 0x10B && magic != 0x20B)             // only PE32 (0x10B) or PE32+ (0x20B); anything else is an unknown layout
+                return;
             bool plus = magic == 0x20B;                       // PE32+ (x64); else PE32 (x86)
             int thunkSize = plus ? 8 : 4;
             long ordinalFlag = plus ? unchecked((long)0x8000000000000000) : 0x80000000L;
@@ -214,7 +216,7 @@ namespace OutlookFileDrag
                     if ((entry & ordinalFlag) != 0)
                         continue;                              // imported by ordinal -> no name
 
-                    long ibnRva = entry & 0x7FFFFFFF;          // RVA of IMAGE_IMPORT_BY_NAME
+                    long ibnRva = entry & ~ordinalFlag;        // RVA of IMAGE_IMPORT_BY_NAME (clear only the ordinal flag -- RVA bit 31 is significant on PE32+)
                     if (ibnRva + 2 >= moduleSize || !StringEquals(b + ibnRva + 2, "DoDragDrop", moduleSize, b))   // +2 skips the Hint
                         continue;
 

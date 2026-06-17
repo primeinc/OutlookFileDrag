@@ -7,8 +7,9 @@
   both architectures; the target is selected by `wix build -arch x86|x64`,
   which sets the built-in $(sys.BUILDARCH) preprocessor variable used below.
 
-  ProductCode / UpgradeCode are preserved verbatim from the .vdproj files so
-  that existing 1.0.11 installs upgrade cleanly.
+  UpgradeCode is preserved verbatim from the .vdproj files so existing 1.0.11
+  installs upgrade cleanly; ProductCode is auto-generated per build (ProductCode="*",
+  see the note on the package below).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"

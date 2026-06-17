@@ -39,13 +39,25 @@ function Resolve-MSBuild {
 }
 
 function Resolve-NuGet {
+    # Pinned version + SHA-256 so the auto-download is reproducible and auditable (versioned
+    # dist.nuget.org URLs are immutable, unlike .../latest/). A pre-supplied .tools\nuget.exe or
+    # a nuget.exe on PATH is trusted and used as-is.
+    $nugetVersion = "6.11.0"
+    $nugetSha256  = "133B9C1EFDC8D86BDCCAE9E296C9E4BC45A6D6472368611AA96B51B3E75FD2E3"
+
     $local = Join-Path $repo ".tools\nuget.exe"
     if (Test-Path $local) { return $local }
     $onPath = Get-Command nuget.exe -ErrorAction SilentlyContinue
     if ($onPath) { return $onPath.Source }
-    Write-Host "Downloading nuget.exe ..."
+
+    Write-Host "Downloading nuget.exe $nugetVersion ..."
     New-Item -ItemType Directory -Force (Join-Path $repo ".tools") | Out-Null
-    Invoke-WebRequest "https://dist.nuget.org/win-x86-commandline/latest/nuget.exe" -OutFile $local
+    Invoke-WebRequest "https://dist.nuget.org/win-x86-commandline/v$nugetVersion/nuget.exe" -OutFile $local
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $local).Hash
+    if ($actual -ne $nugetSha256) {
+        Remove-Item -LiteralPath $local -Force
+        throw "nuget.exe $nugetVersion SHA-256 mismatch: expected $nugetSha256, got $actual"
+    }
     return $local
 }
 
