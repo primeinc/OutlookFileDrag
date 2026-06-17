@@ -196,6 +196,24 @@ Implications for deployment review:
    restored in `Stop()` (called from `Dispose` and from the `ProcessExit`
    handler), so no dangling redirect is left if the add-in is unloaded.
 
+## Build verification
+
+The full add-in is a VSTO solution, which Microsoft documents as .NET Framework
++ Windows/Visual Studio only — it cannot be built off-Windows
+([VSTO support statement](https://learn.microsoft.com/visualstudio/vsto/visual-studio-tools-for-office-runtime#visual-studio-tools-for-office-support-statement)).
+Only `ThisAddIn.cs` depends on `Microsoft.Office.*`; every file holding the
+audit-critical native code has no VSTO dependency. `ci/compile-check/` compiles
+exactly those files against the net472 reference assemblies, so
+`dotnet build` verifies the interop core on Linux (and any OS) with no Visual
+Studio, no Windows runner, and no PowerShell. The `.github/workflows/ci.yml`
+GitHub Actions job runs it on every push/PR. The Windows-only add-in + MSI build
+remains `build.ps1`.
+
+Note for the dependency audit: the compile check runs NuGet's vulnerability
+audit. The add-in currently pins **log4net 2.0.8**, which has a known
+*critical* advisory (GHSA-2cwj-8chv-9pp9) — upgrading to a patched log4net is
+recommended as a follow-up.
+
 ## Verification tooling
 
 `tools/Find-DoDragDropImport.ps1` re-checks which loaded modules import
