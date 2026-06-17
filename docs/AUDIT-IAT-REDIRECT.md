@@ -101,7 +101,7 @@ Source: PE Format § Import Lookup Table.
 | --- | --- | --- |
 | `thunkSize` | `8` (PE32+) / `4` (PE32) | Lookup/IAT entries are 64-bit for PE32+, 32-bit for PE32 |
 | `ordinalFlag` | `0x8000000000000000` (PE32+) / `0x80000000` (PE32) | Ordinal/Name flag — bit 63/31; if set, import is by ordinal (no name) |
-| `entry & 0x7FFFFFFF` | — | 31-bit RVA of the `IMAGE_IMPORT_BY_NAME` (hint/name) entry |
+| `entry & ~ordinalFlag` | — | RVA of the `IMAGE_IMPORT_BY_NAME` (hint/name) entry — clears the ordinal flag (bit 63 on PE32+, bit 31 on PE32) rather than a fixed `0x7FFFFFFF`, which on PE32+ would also clear RVA bit 31 |
 
 ### Hint/Name table — `IMAGE_IMPORT_BY_NAME`
 
@@ -113,8 +113,12 @@ Source: PE Format § Hint/Name Table.
 | `b + ibnRva + 2` | `2` | Name — null-terminated, **case-sensitive** ASCII |
 
 The `+ 2` in `StringEquals(b + ibnRva + 2, "DoDragDrop", …)` is exactly the
-2-byte Hint skip. The DLL-name comparison (`"ole32.dll"`) is case-insensitive
-on purpose; the symbol-name comparison matches the spec's case sensitivity.
+2-byte Hint skip. `StringEquals` performs a **case-insensitive** ASCII compare
+for both the DLL name (`"ole32.dll"`) and the symbol name (`"DoDragDrop"`).
+The PE spec defines import-by-name matching as case-sensitive; comparing
+case-insensitively here is a deliberate, harmless relaxation — `DoDragDrop` is
+ole32's only export by that spelling, so no distinct-case symbol can be
+matched in error.
 
 ## Win32 / COM API contracts
 

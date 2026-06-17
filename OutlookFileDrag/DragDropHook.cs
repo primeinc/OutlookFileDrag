@@ -233,7 +233,10 @@ namespace OutlookFileDrag
                     if ((entry & ordinalFlag) != 0)
                         continue;                              // imported by ordinal -> no name
 
-                    long ibnRva = entry & 0x7FFFFFFF;          // RVA of IMAGE_IMPORT_BY_NAME
+                    // Import-by-name: clear the ordinal flag (bit 63 for PE32+, bit 31 for PE32) to
+                    // get the RVA of the IMAGE_IMPORT_BY_NAME entry. ~ordinalFlag is correct for both
+                    // widths; a bare 0x7FFFFFFF would also clear RVA bit 31 on PE32+.
+                    long ibnRva = entry & ~ordinalFlag;
                     if (ibnRva + 2 >= moduleSize || !StringEquals(b + ibnRva + 2, "DoDragDrop", moduleSize, b))   // +2 skips the Hint
                         continue;
 

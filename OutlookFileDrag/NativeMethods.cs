@@ -65,7 +65,11 @@ namespace OutlookFileDrag
         //Docs: https://learn.microsoft.com/windows/win32/api/dbghelp/nf-dbghelp-imagedirectoryentrytodata
         //Note: all DbgHelp functions are documented single threaded; DragDropHook serializes its calls
         //under DbgHelpLock to honor that contract for the calls it controls.
+        //dbghelp.dll is NOT a KnownDLL, so pin the load to %windir%\System32 to prevent DLL
+        //search-order hijacking (a rogue dbghelp.dll planted in the add-in/working directory).
+        //https://learn.microsoft.com/dotnet/api/system.runtime.interopservices.defaultdllimportsearchpathsattribute
         [DllImport("dbghelp.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern IntPtr ImageDirectoryEntryToData(IntPtr Base, [MarshalAs(UnmanagedType.U1)] bool MappedAsImage, ushort DirectoryEntry, out uint Size);
 
         //IMAGE_DIRECTORY_ENTRY_* indices from winnt.h, as documented for ImageDirectoryEntryToData.

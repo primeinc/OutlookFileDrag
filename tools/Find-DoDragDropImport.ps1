@@ -50,7 +50,10 @@ function Test-PeImportsFunc {
             $entry = U64 $t
             if ($entry -eq 0) { break }
             if (($entry -band 0x8000000000000000) -eq 0) {
-                $o = RvaToOff ([uint32]($entry -band 0x7FFFFFFF))
+                # Ordinal flag (bit 63) already excluded -> remaining low bits are the
+                # IMAGE_IMPORT_BY_NAME RVA. Treat as a 32-bit RVA rather than masking 0x7FFFFFFF,
+                # which would also clear RVA bit 31.
+                $o = RvaToOff ([uint32]($entry -band 0xFFFFFFFF))
                 if ($o -ge 0) { $fn = AsciiZ ($o + 2); if ($fn -ieq $Func) { $script:hits += "$dll ($kind)" } }
             }
             $t += 8
