@@ -36,9 +36,12 @@ arrays to the specific imported symbol and writing the slot** — Windows
 exposes no higher-level API for "redirect this import", so this is
 unavoidable. It is bounded on every read (see below).
 
-`ImageDirectoryEntryToData` is documented as single-threaded; the sole caller
-(`DragDropHook.Start`) runs once on the add-in startup thread, so no external
-synchronization is required.
+`ImageDirectoryEntryToData` is documented as single-threaded. The add-in
+serializes its DbgHelp calls under a private lock (`DragDropHook.DbgHelpLock`)
+to honor that contract for the calls it controls; the sole caller
+(`DragDropHook.Start`) is itself a one-time startup scan on a single thread.
+(No in-process lock can guard a *foreign* component that calls DbgHelp on
+another thread — that residual risk is inherent to any DbgHelp use.)
 
 - ImageDirectoryEntryToData — https://learn.microsoft.com/windows/win32/api/dbghelp/nf-dbghelp-imagedirectoryentrytodata
 - DbgHelp image-access functions — https://learn.microsoft.com/windows/win32/debug/dbghelp-functions#image-access

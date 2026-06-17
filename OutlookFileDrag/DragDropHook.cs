@@ -25,6 +25,12 @@ namespace OutlookFileDrag
         private bool disposed = false;
         private bool isHooked = false;
 
+        // DbgHelp APIs (ImageDirectoryEntryToData) are documented single-threaded, so serialize every
+        // DbgHelp call this add-in makes. NOTE: this only guards our own calls -- it cannot guard a
+        // foreign add-in/diagnostic component calling DbgHelp on another thread, which no in-process
+        // lock of ours can cover. Our use is a one-time startup scan, so contention is effectively nil.
+        private static readonly object DbgHelpLock = new object();
+
         private struct Patch { public IntPtr Slot; public IntPtr Original; }
 
         public DragDropHook()
@@ -159,10 +165,15 @@ namespace OutlookFileDrag
 
             // Official directory lookup. ImageDirectoryEntryToData returns a live pointer to the
             // descriptor table within the mapped image (MappedAsImage = true) and its size in bytes,
-            // or NULL if the module has no such directory.
+            // or NULL if the module has no such directory. Serialized under DbgHelpLock to honor
+            // DbgHelp's single-threaded contract for the calls we control.
             uint impSize, delaySize;
-            IntPtr impDir = NativeMethods.ImageDirectoryEntryToData(baseAddr, true, NativeMethods.IMAGE_DIRECTORY_ENTRY_IMPORT, out impSize);
-            IntPtr delayDir = NativeMethods.ImageDirectoryEntryToData(baseAddr, true, NativeMethods.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, out delaySize);
+            IntPtr impDir, delayDir;
+            lock (DbgHelpLock)
+            {
+                impDir = NativeMethods.ImageDirectoryEntryToData(baseAddr, true, NativeMethods.IMAGE_DIRECTORY_ENTRY_IMPORT, out impSize);
+                delayDir = NativeMethods.ImageDirectoryEntryToData(baseAddr, true, NativeMethods.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, out delaySize);
+            }
 
             if (impDir != IntPtr.Zero)
                 PatchTable(b, size, impDir.ToInt64(), impSize, false, thunkSize, ordinalFlag);

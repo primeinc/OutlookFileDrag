@@ -63,8 +63,8 @@ namespace OutlookFileDrag
         //headers (e_lfanew, the PE signature, the optional-header magic, and the data-directory
         //array): the OS performs that parse and validates the probe for us.
         //Docs: https://learn.microsoft.com/windows/win32/api/dbghelp/nf-dbghelp-imagedirectoryentrytodata
-        //Note: all DbgHelp functions are single threaded; the only caller (DragDropHook.Start) runs
-        //once on the add-in startup thread, so no external synchronization is required here.
+        //Note: all DbgHelp functions are documented single threaded; DragDropHook serializes its calls
+        //under DbgHelpLock to honor that contract for the calls it controls.
         [DllImport("dbghelp.dll", SetLastError = true)]
         public static extern IntPtr ImageDirectoryEntryToData(IntPtr Base, [MarshalAs(UnmanagedType.U1)] bool MappedAsImage, ushort DirectoryEntry, out uint Size);
 
