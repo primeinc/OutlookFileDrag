@@ -36,8 +36,10 @@ namespace OutlookFileDrag
                 AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
 
                 //Start cleanup timer
+                //Require a positive interval: a non-positive value would make the Timer period invalid
+                //(negative -> ArgumentOutOfRangeException aborts startup; 0 -> fires only once).
                 int cleanupTimerInterval;
-                if (!int.TryParse(System.Configuration.ConfigurationManager.AppSettings["CleanupTimerInterval"], out cleanupTimerInterval))
+                if (!int.TryParse(System.Configuration.ConfigurationManager.AppSettings["CleanupTimerInterval"], out cleanupTimerInterval) || cleanupTimerInterval <= 0)
                     cleanupTimerInterval = DefaultCleanupTimerIntervalMinutes;
                 log.InfoFormat("Starting cleanup timer -- run every {0} minutes", cleanupTimerInterval);
                 cleanupTimer = new System.Threading.Timer(CleanupTimer_Callback, null, 0, cleanupTimerInterval * 60 * 1000);
@@ -121,8 +123,10 @@ namespace OutlookFileDrag
         {
             try
             {
+                //Require a positive expiration: 0/negative would delete temp folders created "before
+                //now" -- including the one backing an in-progress drag.
                 int tempFileExpiration;
-                if (!int.TryParse(System.Configuration.ConfigurationManager.AppSettings["TempFileExpiration"], out tempFileExpiration))
+                if (!int.TryParse(System.Configuration.ConfigurationManager.AppSettings["TempFileExpiration"], out tempFileExpiration) || tempFileExpiration <= 0)
                     tempFileExpiration = DefaultTempFileExpirationMinutes;
                 log.InfoFormat("Cleaning up temp files older than {0} minutes", tempFileExpiration);
                 FileUtility.CleanupTempPath(tempFileExpiration);

@@ -65,22 +65,24 @@ namespace OutlookFileDrag
         // is also the method the path-containment tests pin.
         internal static string GetContainedUniqueTarget(string tempRoot, string descriptorName, bool replaceSpecialChars)
         {
-            string leaf = GetSafeLeafName(descriptorName, replaceSpecialChars);
-            string candidate = Path.Combine(tempRoot, leaf);
-
-            // Defense in depth: "../" is normalized by GetFullPath and Path.Combine does not contain,
-            // so verify the resolved path is rooted at tempRoot before any file is created. A leaf of
-            // "." or ".." (which carries no separator) is caught here.
             string rootFull = Path.GetFullPath(tempRoot);
             if (rootFull.Length == 0 || rootFull[rootFull.Length - 1] != Path.DirectorySeparatorChar)
                 rootFull += Path.DirectorySeparatorChar;
-            string candidateFull = Path.GetFullPath(candidate);
-            if (!candidateFull.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
+
+            string leaf = GetSafeLeafName(descriptorName, replaceSpecialChars);
+
+            // Validate containment on the FINAL target. GetUniqueFilename may truncate to MAX_PATH or
+            // append a "(n)" suffix, so checking only the pre-transform candidate would leave a gap;
+            // re-checking the returned path makes containment hold by construction regardless of those
+            // transforms. ("../" is normalized by GetFullPath and Path.Combine does not contain; a
+            // separator-free leaf of "." or ".." is caught here too.)
+            string target = GetUniqueFilename(Path.GetFullPath(Path.Combine(tempRoot, leaf)));
+            if (!Path.GetFullPath(target).StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException(
                     string.Format("Refusing to extract '{0}': resolved path '{1}' is outside temp folder '{2}'",
-                        descriptorName, candidateFull, rootFull));
+                        descriptorName, target, rootFull));
 
-            return GetUniqueFilename(candidateFull);
+            return target;
         }
 
         // Reduce a descriptor-supplied name to a single safe filename component. BOTH '/' and '\'
@@ -120,36 +122,40 @@ namespace OutlookFileDrag
 
         // Uniqueness + MAX_PATH truncation on an ALREADY-contained path. Does not sanitize names --
         // that is GetSafeLeafName's job, applied before the path is combined with the temp root.
+        // Only the NAME component is ever shortened; the directory is preserved verbatim. (Truncating
+        // an absolute path from the left could cut off the temp-folder segments and move the target
+        // out of the sandbox -- so directory truncation is never done here.)
         internal static string GetUniqueFilename(string filename)
         {
-            string filenameNoExt;
-            string ext;
+            string directory = Path.GetDirectoryName(filename) ?? string.Empty;
+            string nameWithoutExt = Path.GetFileNameWithoutExtension(filename);
+            string ext = Path.GetExtension(filename);
 
-            //If filename is too long, truncate filename
-            if (filename.Length >= NativeMethods.MAX_PATH)
-            {
-                ext = Path.GetExtension(filename);
-                filename = filename.Substring(0, NativeMethods.MAX_PATH - ext.Length - 1) + ext;
-            }
+            // Room left for the name component once the directory, separator and extension are fixed.
+            int maxNameLength = NativeMethods.MAX_PATH - directory.Length - 1 - ext.Length;
+            if (maxNameLength < 1)
+                throw new PathTooLongException(string.Format("Temp directory path leaves no room for a filename within MAX_PATH: {0}", directory));
 
-            //If file does not exist, use original filename
-            if (!File.Exists(filename))
-                return filename;
+            if (nameWithoutExt.Length > maxNameLength)
+                nameWithoutExt = nameWithoutExt.Substring(0, maxNameLength);
 
-            //Try appending number to filename until unique filename is found
-            filenameNoExt = Path.Combine(Path.GetDirectoryName(filename), Path.GetFileNameWithoutExtension(filename));
-            ext = Path.GetExtension(filename);
+            string candidate = Path.Combine(directory, nameWithoutExt + ext);
+            if (!File.Exists(candidate))
+                return candidate;
 
+            //Try appending a number to the name (shortening the name further to make room) until unique
             for (int index = 1; index < 1024; index++)
             {
-                string newFilename = string.Format("{0} ({1}){2}", filenameNoExt, index, ext);
+                string suffix = string.Format(" ({0})", index);
+                int maxNameLengthWithSuffix = maxNameLength - suffix.Length;
+                if (maxNameLengthWithSuffix < 1)
+                    throw new PathTooLongException(string.Format("Temp directory path leaves no room for a unique filename within MAX_PATH: {0}", directory));
 
-                //If new filename is too long, truncate new filename
-                if (newFilename.Length > NativeMethods.MAX_PATH)
-                {
-                    newFilename = string.Format("{0} ({1}){2}", filenameNoExt.Substring(0, NativeMethods.MAX_PATH - ext.Length - 8), index, ext);
-                }
+                string trimmedName = nameWithoutExt.Length > maxNameLengthWithSuffix
+                    ? nameWithoutExt.Substring(0, maxNameLengthWithSuffix)
+                    : nameWithoutExt;
 
+                string newFilename = Path.Combine(directory, trimmedName + suffix + ext);
                 if (!File.Exists(newFilename))
                     return newFilename;
             }

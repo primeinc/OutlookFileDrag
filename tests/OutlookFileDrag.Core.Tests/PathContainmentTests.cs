@@ -77,5 +77,23 @@ namespace OutlookFileDrag.Core.Tests
             }
             finally { Directory.Delete(root, true); }
         }
+
+        [Fact]
+        public void ContainedTarget_OverlongName_TruncatesNameButStaysContained()
+        {
+            string root = NewTempRoot();
+            try
+            {
+                // A name far past MAX_PATH must be shortened in its NAME component only, never by
+                // cutting directory segments -- the result stays under the temp root.
+                string longName = new string('a', 500) + ".bin";
+                string target = FileUtility.GetContainedUniqueTarget(root, longName, replaceSpecialChars: false);
+                string full = Path.GetFullPath(target);
+                Assert.StartsWith(FullRootWithSep(root), full, StringComparison.OrdinalIgnoreCase);
+                Assert.True(full.Length <= NativeMethods.MAX_PATH, "target exceeds MAX_PATH: " + full.Length);
+                Assert.EndsWith(".bin", full);
+            }
+            finally { Directory.Delete(root, true); }
+        }
     }
 }

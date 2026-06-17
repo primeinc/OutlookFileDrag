@@ -52,5 +52,18 @@ namespace OutlookFileDrag.Core.Tests
             Assert.Equal(2, b2[0].cfFormat);
             Assert.Equal(2, b3[0].cfFormat);
         }
+
+        [Theory]
+        [InlineData(-1)]            // a COM ULONG > int.MaxValue marshals to a negative int
+        [InlineData(int.MinValue)]
+        [InlineData(int.MaxValue)]
+        public void Skip_OverflowingOrNegativeCount_ReturnsSFalse_WithoutCorruptingIndex(int celt)
+        {
+            var e = new FormatEtcEnumerator(Formats(3));
+            Assert.Equal(NativeMethods.S_FALSE, e.Skip(celt));
+            // Position must be at the end -- the next read must not throw / return an item.
+            var buf = new FORMATETC[1];
+            Assert.Equal(NativeMethods.S_FALSE, e.Next(1, buf, null));
+        }
     }
 }

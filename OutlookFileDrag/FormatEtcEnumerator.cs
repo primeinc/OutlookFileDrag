@@ -53,9 +53,13 @@ namespace OutlookFileDrag
         public int Skip(int celt)
         {
             //Per IEnumFORMATETC::Skip, S_OK iff exactly celt items were skipped; otherwise S_FALSE
-            //with the position left at the end. The previous "Length - 1" bound wrongly reported
-            //S_FALSE when skipping exactly to the end.
-            if (index + celt > formats.Length)
+            //with the position left at the end. celt is a COM ULONG, so a value > int.MaxValue
+            //marshals to a negative int; interpret it as unsigned and compute the target in 64-bit so
+            //a huge/overflowing count cannot wrap the bound check and drive index negative (which
+            //would make the next Next() read out of bounds). (The previous "Length - 1" bound also
+            //wrongly reported S_FALSE when skipping exactly to the end.)
+            long target = (long)index + (uint)celt;
+            if (target > formats.Length)
             {
                 index = formats.Length;
                 return NativeMethods.S_FALSE;
