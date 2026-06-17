@@ -178,6 +178,13 @@ namespace OutlookFileDrag
             if (dirPtr == 0 || dirSize == 0)
                 return;
 
+            // Defense in depth: ImageDirectoryEntryToData already validated the directory RVA, but
+            // re-confirm the whole returned extent lies within the module's mapped image before
+            // walking it, so a corrupted/rewritten image cannot push the descriptor scan
+            // out of bounds -> AccessViolationException.
+            if (dirPtr < b || dirPtr + dirSize > b + moduleSize)
+                return;
+
             int descSize = delay ? 32 : 20;
             int nameOff = delay ? 4 : 12;     // RVA of imported DLL name
             int intOff = delay ? 16 : 0;      // RVA of Import Name Table (names)

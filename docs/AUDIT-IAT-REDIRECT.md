@@ -120,7 +120,9 @@ on purpose; the symbol-name comparison matches the spec's case sensitivity.
 - Returns a pointer to the directory data, or `NULL` on failure
   (`GetLastError`). With `MappedAsImage = TRUE` the returned pointer is a live
   VA inside the loaded module and `Size` is the directory's byte length — the
-  add-in iterates descriptors only within `[ptr, ptr + size)`.
+  add-in iterates descriptors only within `[ptr, ptr + size)`, and as
+  defense-in-depth re-confirms that extent lies within the module's mapped
+  image (`[base, base + ModuleMemorySize)`) before walking it.
 - Single-threaded (see design rule above).
 - https://learn.microsoft.com/windows/win32/api/dbghelp/nf-dbghelp-imagedirectoryentrytodata
 
