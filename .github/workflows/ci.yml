@@ -1,15 +1,23 @@
 name: CI
 
-# PR/push gate, two jobs:
-#  - compile-check: the platform-independent interop core, built on Linux (fast;
-#    catches breakage in the audit-critical native code with no Windows runner).
-#  - build-windows: the full VSTO add-in + WiX MSIs, built on Windows via the
-#    reusable build-windows workflow (which runs the justfile recipes).
+# Two jobs:
+#  - compile-check: the platform-independent interop core on Linux (fast; runs on
+#    every push and PR so breakage in the audit-critical native code is caught
+#    without a Windows runner).
+#  - build-windows: the full VSTO add-in + WiX MSIs. This is the slow/expensive
+#    job, so it is gated to the release line -- pushes to `master` and
+#    `release/**` -- and does NOT run on pull requests. Release tags are covered
+#    separately by release.yml.
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, 'release/**' ]
   pull_request:
+
+# Cancel superseded in-progress runs for the same ref (e.g. rapid pushes / PR updates).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -33,4 +41,6 @@ jobs:
 
   build-windows:
     name: Add-in + MSIs (Windows)
+    # Release line only -- skip on pull requests.
+    if: github.event_name == 'push'
     uses: ./.github/workflows/build-windows.yml

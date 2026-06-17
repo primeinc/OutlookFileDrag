@@ -1,11 +1,19 @@
 name: Prune stale branches
 
-# Delete branches whose pull request has already been merged, and turn on the
-# repo's "automatically delete head branches" setting so future merged PR
-# branches self-clean. Uses only the first-party GitHub CLI / REST API.
+# Delete branches whose pull request has already been merged. First-party
+# GitHub CLI / REST only.
 #
-# Safety: never the default branch, never a protected branch, never a fork's
-# branch, and only branches tied to an already-merged PR.
+# A branch is deleted only when ALL hold: it is the head of an already-merged,
+# same-repo PR; it is not the default branch; it is not protected; it has no
+# open PR; and its CURRENT ref SHA still equals the merged PR's head SHA -- so a
+# branch whose name was recreated or reused for new work is never removed.
+#
+# Note: enabling the repo's "Automatically delete head branches" setting is the
+# better long-term fix, but that is a repo-administration change and the default
+# GITHUB_TOKEN has no `administration` scope (workflow tokens can't be granted
+# one), so enable it once under Settings > General > Pull Requests, or via an
+# admin PAT / GitHub App token. This workflow deliberately needs only
+# `contents: write`.
 
 on:
   schedule:
@@ -23,24 +31,34 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
-      # `-F` sends a typed JSON boolean (true); `-f` would send the string "true".
-      - name: Enable auto-delete of merged PR head branches
-        run: gh api -X PATCH "repos/$REPO" -F delete_branch_on_merge=true
-
-      - name: Delete merged PR head branches (skip default / protected / forks)
+      - name: Delete merged PR head branches (verified by ref SHA)
         run: |
           set -euo pipefail
           owner="${REPO%/*}"
           default="$(gh api "repos/$REPO" --jq .default_branch)"
+
+          # Names we must never delete: open-PR heads and protected branches.
+          open_branches="$(gh pr list --repo "$REPO" --state open --limit 500 \
+            --json headRefName --jq '.[].headRefName')"
+          protected="$(gh api --paginate "repos/$REPO/branches?protected=true" \
+            --jq '.[].name')"
+          is_member() { printf '%s\n' "$2" | grep -qxF -- "$1"; }
+
+          # Merged, same-repo PR branches paired with their merged head SHA.
           gh pr list --repo "$REPO" --state merged --limit 200 \
-            --json headRefName,headRepositoryOwner \
-            --jq ".[] | select(.headRepositoryOwner.login == \"$owner\") | .headRefName" \
-          | sort -u | while read -r b; do
+            --json headRefName,headRefOid,headRepositoryOwner \
+            --jq ".[] | select(.headRepositoryOwner.login == \"$owner\") | \"\(.headRefName)\t\(.headRefOid)\"" \
+          | sort -u | while IFS="$(printf '\t')" read -r b sha; do
               [ -z "$b" ] && continue
               [ "$b" = "$default" ] && continue
-              prot="$(gh api "repos/$REPO/branches/$b" --jq .protected 2>/dev/null || echo missing)"
-              [ "$prot" = "missing" ] && continue            # branch already gone
-              [ "$prot" = "true" ] && { echo "skip protected: $b"; continue; }
-              echo "deleting: $b"
+              is_member "$b" "$open_branches" && { echo "skip (open PR): $b"; continue; }
+              is_member "$b" "$protected"     && { echo "skip (protected): $b"; continue; }
+
+              # Current ref SHA via the git-refs API (slash-safe). 404 => already gone.
+              cur="$(gh api "repos/$REPO/git/ref/heads/$b" --jq .object.sha 2>/dev/null || echo gone)"
+              [ "$cur" = "gone" ]  && { echo "skip (already deleted): $b"; continue; }
+              [ "$cur" != "$sha" ] && { echo "skip (ref moved / name reused): $b"; continue; }
+
+              echo "deleting: $b @ $sha"
               gh api -X DELETE "repos/$REPO/git/refs/heads/$b"
             done

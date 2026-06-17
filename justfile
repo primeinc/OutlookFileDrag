@@ -58,6 +58,7 @@ restore:
 build: restore
     #!pwsh
     $ErrorActionPreference = 'Stop'
+    $PSNativeCommandUseErrorActionPreference = $true   # msbuild non-zero exit => terminating
     # Reuse an existing self-signed cert; don't mint one per build (store bloat).
     $subject = 'CN=OutlookFileDrag (Build)'
     $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject } | Select-Object -First 1
@@ -74,13 +75,14 @@ build: restore
 build:
     @echo 'build (VSTO add-in) is Windows-only; off-Windows run: just compile-check'; exit 1
 
-# Build x86 + x64 MSIs with WiX for the given version (e.g. `just msi 1.0.13`).
-# Requires `just build` to have produced OutlookFileDrag/bin/<config> first.
+# Build the add-in then both (x86 + x64) MSIs with WiX (e.g. `just msi 1.0.13`).
+# Depends on `build`, so it works end-to-end on a clean tree.
 [group('release')]
 [windows]
-msi version=VERSION:
+msi version=VERSION: build
     #!pwsh
     $ErrorActionPreference = 'Stop'
+    $PSNativeCommandUseErrorActionPreference = $true   # native non-zero exit => terminating
     dotnet tool restore
     dotnet wix extension add -acceptEula {{ WIX_EULA }} -g WixToolset.UI.wixext/7.0.0
     dotnet wix extension add -acceptEula {{ WIX_EULA }} -g WixToolset.Netfx.wixext/7.0.0
@@ -90,6 +92,7 @@ msi version=VERSION:
             -d Version={{ version }} -b OutlookFileDrag/bin/{{ CONFIGURATION }} -b . `
             -ext WixToolset.UI.wixext -ext WixToolset.Netfx.wixext `
             -o "dist/OutlookFileDrag-{{ version }}-$arch.msi"
+        if ($LASTEXITCODE -ne 0) { throw "wix build failed for $arch (exit $LASTEXITCODE)" }
     }
 
 [group('release')]
@@ -97,10 +100,11 @@ msi version=VERSION:
 msi version=VERSION:
     @echo 'msi (WiX build) is Windows-only.'; exit 1
 
-# Full release: build the add-in, then both MSIs (e.g. `just release 1.0.13`).
+# Full release: the add-in + both MSIs (e.g. `just release 1.0.13`). `msi`
+# already depends on `build`, so this is the friendly name CI invokes.
 [group('release')]
 [windows]
-release version=VERSION: build (msi version)
+release version=VERSION: (msi version)
 
 [group('release')]
 [unix]
