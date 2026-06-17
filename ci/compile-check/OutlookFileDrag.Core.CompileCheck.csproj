@@ -1,0 +1,66 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Cross-platform COMPILE CHECK for the platform-independent interop core.
+
+    The full add-in is VSTO, which Microsoft documents as .NET Framework +
+    Windows/Visual Studio only and cannot be built off-Windows:
+      https://learn.microsoft.com/visualstudio/vsto/visual-studio-tools-for-office-runtime#visual-studio-tools-for-office-support-statement
+
+    However, every file that carries the audit-critical native code (the IAT
+    redirect, PE/import-table walking, P/Invoke, the OLE data object) has NO
+    Microsoft.Office.* dependency; only ThisAddIn.cs does. This project compiles
+    just those files, targeting net472 via the reference-assemblies NuGet
+    package, so `dotnet build` verifies the interop core on Linux (and any OS)
+    with no Visual Studio, no Windows runner, and no PowerShell.
+
+    It produces no shipping artifact; it is a compile gate only. The real
+    add-in + MSI are still built on Windows (see build.ps1).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>OutlookFileDrag.Core.CompileCheck</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <SignAssembly>false</SignAssembly>
+    <!-- This is a compile gate, not a deliverable; keep it quiet and self-contained. -->
+    <Deterministic>true</Deterministic>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+
+    <!-- Warnings are errors (they usually are). Includes the NuGet vulnerability
+         audit (NU19xx) at every severity over direct + transitive packages, so a
+         known-vulnerable dependency fails the build instead of shipping. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsAsErrors>NU1901;NU1902;NU1903;NU1904;NU1905</WarningsAsErrors>
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <NuGetAuditLevel>low</NuGetAuditLevel>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Lets a net472 TFM compile on Linux/macOS without the Windows dev pack. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
+    <!-- Same version the add-in ships (packages.config). -->
+    <PackageReference Include="log4net" Version="3.3.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Framework references the core uses that aren't in the default set. -->
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Configuration" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The VSTO-free interop core (everything except ThisAddIn*). -->
+    <Compile Include="..\..\OutlookFileDrag\NativeMethods.cs" />
+    <Compile Include="..\..\OutlookFileDrag\DragDropHook.cs" />
+    <Compile Include="..\..\OutlookFileDrag\DataObjectHelper.cs" />
+    <Compile Include="..\..\OutlookFileDrag\OutlookDataObject.cs" />
+    <Compile Include="..\..\OutlookFileDrag\FormatEtcEnumerator.cs" />
+    <Compile Include="..\..\OutlookFileDrag\OutlookDragSource.cs" />
+    <Compile Include="..\..\OutlookFileDrag\FileUtility.cs" />
+  </ItemGroup>
+
+</Project>

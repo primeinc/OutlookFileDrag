@@ -25,6 +25,12 @@ namespace OutlookFileDrag
         private bool disposed = false;
         private bool isHooked = false;
 
+        // DbgHelp APIs (ImageDirectoryEntryToData) are documented single-threaded, so serialize every
+        // DbgHelp call this add-in makes. NOTE: this only guards our own calls -- it cannot guard a
+        // foreign add-in/diagnostic component calling DbgHelp on another thread, which no in-process
+        // lock of ours can cover. Our use is a one-time startup scan, so contention is effectively nil.
+        private static readonly object DbgHelpLock = new object();
+
         private struct Patch { public IntPtr Slot; public IntPtr Original; }
 
         public DragDropHook()
@@ -133,47 +139,61 @@ namespace OutlookFileDrag
 
         // --- Import-table patching ------------------------------------------------------------
 
-        // Parse the module's PE import / delay-import tables to find ole32!DoDragDrop slots. Every RVA
-        // is validated against the module's mapped size (module.ModuleMemorySize) before it is read:
-        // a corrupted header, a truncated module, or one rewritten by security software must NOT cause
-        // an out-of-bounds read -> AccessViolationException is uncatchable and would fastfail OUTLOOK.EXE,
-        // the exact crash class this add-in exists to prevent.
+        // Find and redirect the ole32!DoDragDrop slots in a module's import / delay-import tables.
+        //
+        // Locating the directory tables is delegated to the official DbgHelp helper
+        // ImageDirectoryEntryToData (no hand-parsing of the DOS/PE headers, the optional-header
+        // magic, or the data-directory array): the OS performs that parse and bounds the probe.
+        // What remains hand-rolled -- walking the descriptor/thunk arrays to the specific imported
+        // symbol, and rewriting the slot -- has no higher-level Win32 API, so every RVA is still
+        // validated against the module's mapped size (module.ModuleMemorySize) before it is read.
+        // An out-of-bounds read -> AccessViolationException is uncatchable and would fastfail
+        // OUTLOOK.EXE, the exact crash class this add-in exists to prevent.
         private void PatchModule(ProcessModule module)
         {
             IntPtr baseAddr = module.BaseAddress;
             long b = baseAddr.ToInt64();
             long size = module.ModuleMemorySize;
 
-            if (size < 0x40)                                  // room for the DOS header + e_lfanew
-                return;
-            if (Marshal.ReadInt16(baseAddr) != 0x5A4D)        // 'MZ'
-                return;
-            int elf = Marshal.ReadInt32((IntPtr)(b + 0x3C));
-            if (elf <= 0 || (long)elf + 248 > size)           // PE signature + COFF + (min) optional header must fit
-                return;
-            if (Marshal.ReadInt32((IntPtr)(b + elf)) != 0x00004550)   // 'PE\0\0'
-                return;
-
-            long opt = b + elf + 24;
-            short magic = Marshal.ReadInt16((IntPtr)opt);
-            if (magic != 0x10B && magic != 0x20B)             // only PE32 (0x10B) or PE32+ (0x20B); anything else is an unknown layout
-                return;
-            bool plus = magic == 0x20B;                       // PE32+ (x64); else PE32 (x86)
-            int thunkSize = plus ? 8 : 4;
+            // The Windows loader never mixes 32- and 64-bit modules in one process, so every module
+            // we see matches the host process bitness. That fixes the thunk width and the import-by-
+            // ordinal flag without reading the PE optional-header Magic field by hand.
+            //   https://learn.microsoft.com/dotnet/api/system.intptr.size
+            bool plus = IntPtr.Size == 8;                      // PE32+ (x64) in a 64-bit process; else PE32
+            int thunkSize = IntPtr.Size;
             long ordinalFlag = plus ? unchecked((long)0x8000000000000000) : 0x80000000L;
-            long dataDir = opt + (plus ? 112 : 96);
 
-            if (dataDir + 112 - b > size)                     // the data directories we read (incl. [13]) must fit
-                return;
+            // Official directory lookup. ImageDirectoryEntryToData returns a live pointer to the
+            // descriptor table within the mapped image (MappedAsImage = true) and its size in bytes,
+            // or NULL if the module has no such directory. Serialized under DbgHelpLock to honor
+            // DbgHelp's single-threaded contract for the calls we control.
+            uint impSize, delaySize;
+            IntPtr impDir, delayDir;
+            lock (DbgHelpLock)
+            {
+                impDir = NativeMethods.ImageDirectoryEntryToData(baseAddr, true, NativeMethods.IMAGE_DIRECTORY_ENTRY_IMPORT, out impSize);
+                delayDir = NativeMethods.ImageDirectoryEntryToData(baseAddr, true, NativeMethods.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, out delaySize);
+            }
 
-            // Normal imports (data directory[1]) and delay imports (data directory[13])
-            PatchTable(b, size, Marshal.ReadInt32((IntPtr)(dataDir + 1 * 8)), false, thunkSize, ordinalFlag);
-            PatchTable(b, size, Marshal.ReadInt32((IntPtr)(dataDir + 13 * 8)), true, thunkSize, ordinalFlag);
+            if (impDir != IntPtr.Zero)
+                PatchTable(b, size, impDir.ToInt64(), impSize, false, thunkSize, ordinalFlag);
+            if (delayDir != IntPtr.Zero)
+                PatchTable(b, size, delayDir.ToInt64(), delaySize, true, thunkSize, ordinalFlag);
         }
 
-        private void PatchTable(long b, long moduleSize, int dirRva, bool delay, int thunkSize, long ordinalFlag)
+        // dirPtr/dirSize is the descriptor table returned by ImageDirectoryEntryToData (an absolute
+        // pointer into the mapped image and its byte length). The descriptors' internal fields are
+        // still RVAs, so they are resolved as base (b) + RVA and bounds-checked against moduleSize.
+        private void PatchTable(long b, long moduleSize, long dirPtr, long dirSize, bool delay, int thunkSize, long ordinalFlag)
         {
-            if (dirRva <= 0 || dirRva >= moduleSize)
+            if (dirPtr == 0 || dirSize == 0)
+                return;
+
+            // Defense in depth: ImageDirectoryEntryToData already validated the directory RVA, but
+            // re-confirm the whole returned extent lies within the module's mapped image before
+            // walking it, so a corrupted/rewritten image cannot push the descriptor scan
+            // out of bounds -> AccessViolationException.
+            if (dirPtr < b || dirPtr + dirSize > b + moduleSize)
                 return;
 
             int descSize = delay ? 32 : 20;
@@ -181,11 +201,8 @@ namespace OutlookFileDrag
             int intOff = delay ? 16 : 0;      // RVA of Import Name Table (names)
             int iatOff = delay ? 12 : 16;     // RVA of Import Address Table (slots to patch)
 
-            for (long d = b + dirRva; ; d += descSize)
+            for (long d = dirPtr; d + descSize <= dirPtr + dirSize; d += descSize)   // stay within the directory
             {
-                if ((d - b) + descSize > moduleSize)          // the whole descriptor must be in-bounds
-                    break;
-
                 int nameRva = Marshal.ReadInt32((IntPtr)(d + nameOff));
                 int intRva = Marshal.ReadInt32((IntPtr)(d + intOff));
                 int iatRva = Marshal.ReadInt32((IntPtr)(d + iatOff));
@@ -216,7 +233,10 @@ namespace OutlookFileDrag
                     if ((entry & ordinalFlag) != 0)
                         continue;                              // imported by ordinal -> no name
 
-                    long ibnRva = entry & ~ordinalFlag;        // RVA of IMAGE_IMPORT_BY_NAME (clear only the ordinal flag -- RVA bit 31 is significant on PE32+)
+                    // Import-by-name: clear the ordinal flag (bit 63 for PE32+, bit 31 for PE32) to
+                    // get the RVA of the IMAGE_IMPORT_BY_NAME entry. ~ordinalFlag is correct for both
+                    // widths; a bare 0x7FFFFFFF would also clear RVA bit 31 on PE32+.
+                    long ibnRva = entry & ~ordinalFlag;
                     if (ibnRva + 2 >= moduleSize || !StringEquals(b + ibnRva + 2, "DoDragDrop", moduleSize, b))   // +2 skips the Hint
                         continue;
 

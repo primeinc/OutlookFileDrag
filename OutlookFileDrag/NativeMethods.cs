@@ -58,6 +58,24 @@ namespace OutlookFileDrag
 
         public const uint PAGE_READWRITE = 0x04;
 
+        //Official DbgHelp helper for locating a data directory inside a loaded module. We use it to
+        //find the import / delay-import descriptor tables instead of hand-parsing the DOS + PE
+        //headers (e_lfanew, the PE signature, the optional-header magic, and the data-directory
+        //array): the OS performs that parse and validates the probe for us.
+        //Docs: https://learn.microsoft.com/windows/win32/api/dbghelp/nf-dbghelp-imagedirectoryentrytodata
+        //Note: all DbgHelp functions are documented single threaded; DragDropHook serializes its calls
+        //under DbgHelpLock to honor that contract for the calls it controls.
+        //dbghelp.dll is NOT a KnownDLL, so pin the load to %windir%\System32 to prevent DLL
+        //search-order hijacking (a rogue dbghelp.dll planted in the add-in/working directory).
+        //https://learn.microsoft.com/dotnet/api/system.runtime.interopservices.defaultdllimportsearchpathsattribute
+        [DllImport("dbghelp.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        public static extern IntPtr ImageDirectoryEntryToData(IntPtr Base, [MarshalAs(UnmanagedType.U1)] bool MappedAsImage, ushort DirectoryEntry, out uint Size);
+
+        //IMAGE_DIRECTORY_ENTRY_* indices from winnt.h, as documented for ImageDirectoryEntryToData.
+        public const ushort IMAGE_DIRECTORY_ENTRY_IMPORT = 1;        //Import directory
+        public const ushort IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13; //Delay import table
+
         //Allocator whose family matches the GlobalFree the drop target uses to release the CF_HDROP medium
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
