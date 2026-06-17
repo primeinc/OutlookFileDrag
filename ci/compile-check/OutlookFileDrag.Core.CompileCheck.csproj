@@ -28,13 +28,22 @@
     <!-- This is a compile gate, not a deliverable; keep it quiet and self-contained. -->
     <Deterministic>true</Deterministic>
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+
+    <!-- Warnings are errors (they usually are). Includes the NuGet vulnerability
+         audit (NU19xx) at every severity over direct + transitive packages, so a
+         known-vulnerable dependency fails the build instead of shipping. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsAsErrors>NU1901;NU1902;NU1903;NU1904;NU1905</WarningsAsErrors>
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <NuGetAuditLevel>low</NuGetAuditLevel>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- Lets a net472 TFM compile on Linux/macOS without the Windows dev pack. -->
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
     <!-- Same version the add-in ships (packages.config). -->
-    <PackageReference Include="log4net" Version="2.0.8" />
+    <PackageReference Include="log4net" Version="3.3.1" />
   </ItemGroup>
 
   <ItemGroup>

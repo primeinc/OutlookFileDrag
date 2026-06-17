@@ -209,10 +209,13 @@ Studio, no Windows runner, and no PowerShell. The `.github/workflows/ci.yml`
 GitHub Actions job runs it on every push/PR. The Windows-only add-in + MSI build
 remains `build.ps1`.
 
-Note for the dependency audit: the compile check runs NuGet's vulnerability
-audit. The add-in currently pins **log4net 2.0.8**, which has a known
-*critical* advisory (GHSA-2cwj-8chv-9pp9) — upgrading to a patched log4net is
-recommended as a follow-up.
+Dependency audit: the compile check runs NuGet's vulnerability audit with
+warnings treated as errors (`TreatWarningsAsErrors` + `NuGetAuditMode=all`,
+`NuGetAuditLevel=low`), so a known-vulnerable package fails the build rather
+than shipping. The add-in was upgraded from **log4net 2.0.8** (which carried a
+known *critical* advisory, GHSA-2cwj-8chv-9pp9) to **log4net 3.3.1**, which
+clears the audit; the App.config appender/section-handler types are unchanged
+in 3.x, and the interop core compiles clean against it.
 
 ## Verification tooling
 
