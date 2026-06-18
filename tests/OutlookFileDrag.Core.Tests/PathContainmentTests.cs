@@ -110,6 +110,27 @@ namespace OutlookFileDrag.Core.Tests
         }
 
         [Fact]
+        public void GetContainedUniqueTarget_RelativeRoot_OverlongName_ResolvedPathStaysWithinMaxPath()
+        {
+            // Arrange -- a RELATIVE tempRoot resolves (via Path.GetFullPath) to a longer absolute
+            // directory. The MAX_PATH name-budget must be charged against that ABSOLUTE length so the
+            // resolved path never overruns MAX_PATH. Were the overlong name truncated against the
+            // shorter relative directory instead, Path.GetFullPath would push the result past MAX_PATH
+            // and throw on .NET Framework. (No directory is created -- the helper only probes
+            // File.Exists -- so nothing needs cleanup.)
+            string relativeRoot = "OFD_RelRoot_" + Guid.NewGuid().ToString("N");
+            string longName = new string('a', 500) + ".bin";
+
+            // Act
+            string target = FileUtility.GetContainedUniqueTarget(relativeRoot, longName, replaceSpecialChars: false);
+
+            // Assert
+            string resolved = Path.GetFullPath(target);
+            Assert.StartsWith(FullRootWithSep(relativeRoot), resolved, StringComparison.OrdinalIgnoreCase);
+            Assert.True(resolved.Length <= NativeMethods.MAX_PATH, "resolved path exceeds MAX_PATH: " + resolved.Length);
+        }
+
+        [Fact]
         public void GetContainedUniqueTarget_NameCollision_ReturnsDistinctContainedPath()
         {
             // Arrange -- the first extraction occupies the target; the second must get a different,

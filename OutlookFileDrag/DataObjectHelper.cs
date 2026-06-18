@@ -127,6 +127,11 @@ namespace OutlookFileDrag
                     stream.Read(bytes, 0, bytes.Length);
                 }
 
+                //Reject a medium too small to even hold the leading cItems field BEFORE marshaling the
+                //header below: Marshal.PtrToStructure reads that 4-byte field, which would over-read the
+                //unmanaged buffer for a truncated medium. (ValidateCount re-checks once cItems is known.)
+                FileGroupDescriptor.ValidateHeaderPresent(bytes.Length);
+
                 //Copy byte array into unmanaged memory
                 log.Debug("Copying structure into unmanaged memory");
                 ptrFgd = Marshal.AllocHGlobal(bytes.Length);
@@ -214,6 +219,11 @@ namespace OutlookFileDrag
                     stream.Read(bytes, 0, bytes.Length);
                 }
                 
+                //Reject a medium too small to even hold the leading cItems field BEFORE marshaling the
+                //header below: Marshal.PtrToStructure reads that 4-byte field, which would over-read the
+                //unmanaged buffer for a truncated medium. (ValidateCount re-checks once cItems is known.)
+                FileGroupDescriptor.ValidateHeaderPresent(bytes.Length);
+
                 //Copy byte array into unmanaged memory
                 log.Debug("Copying structure into unmanaged memory");
                 ptrFgd = Marshal.AllocHGlobal(bytes.Length);

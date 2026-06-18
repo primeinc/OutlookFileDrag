@@ -14,14 +14,24 @@ namespace OutlookFileDrag
         // The leading FILEGROUPDESCRIPTOR.cItems field (a UINT) precedes the descriptor array.
         public const int CItemsFieldSize = sizeof(uint);
 
+        // Throws if the buffer cannot even hold the leading cItems field. MUST be called BEFORE the
+        // FILEGROUPDESCRIPTOR header is marshaled out of the buffer: Marshal.PtrToStructure reads
+        // CItemsFieldSize bytes to populate cItems, so a shorter buffer would over-read the heap
+        // allocation the medium was copied into. Split out from ValidateCount (which can only run
+        // once cItems is known) so the reader can fence that over-read off ahead of marshaling.
+        public static void ValidateHeaderPresent(int bufferLength)
+        {
+            if (bufferLength < CItemsFieldSize)
+                throw new InvalidOperationException(
+                    string.Format("FileGroupDescriptor buffer too small ({0} bytes) to contain the item count", bufferLength));
+        }
+
         // Throws if a buffer of bufferLength bytes cannot contain cItems descriptors of
         // descriptorSize bytes each (after the leading cItems field). Overflow-safe: the capacity
         // is computed by division in 64-bit, never by multiplying cItems * descriptorSize.
         public static void ValidateCount(int bufferLength, int descriptorSize, uint cItems)
         {
-            if (bufferLength < CItemsFieldSize)
-                throw new InvalidOperationException(
-                    string.Format("FileGroupDescriptor buffer too small ({0} bytes) to contain the item count", bufferLength));
+            ValidateHeaderPresent(bufferLength);
             if (descriptorSize <= 0)
                 throw new ArgumentOutOfRangeException("descriptorSize", descriptorSize, "Descriptor size must be positive");
 

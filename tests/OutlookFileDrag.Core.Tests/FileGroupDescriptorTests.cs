@@ -78,6 +78,34 @@ namespace OutlookFileDrag.Core.Tests
             Assert.IsType<InvalidOperationException>(ex);
         }
 
+        [Fact]
+        public void ValidateHeaderPresent_BufferTooSmallForCountField_Throws()
+        {
+            // Arrange -- the pre-marshal guard must reject a medium that cannot hold the cItems field,
+            // before DataObjectHelper marshals the FILEGROUPDESCRIPTOR header (a 4-byte read that would
+            // otherwise over-read the unmanaged buffer).
+            int buffer = CountField - 1;
+
+            // Act
+            Exception ex = Record.Exception(() => FileGroupDescriptor.ValidateHeaderPresent(buffer));
+
+            // Assert
+            Assert.IsType<InvalidOperationException>(ex);
+        }
+
+        [Fact]
+        public void ValidateHeaderPresent_ExactlyCountField_DoesNotThrow()
+        {
+            // Arrange -- a buffer holding exactly the cItems field (zero descriptors) is marshalable.
+            int buffer = CountField;
+
+            // Act
+            Exception ex = Record.Exception(() => FileGroupDescriptor.ValidateHeaderPresent(buffer));
+
+            // Assert
+            Assert.Null(ex);
+        }
+
         [Theory]
         [InlineData(0)]
         [InlineData(-1)]
