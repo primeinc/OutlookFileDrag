@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    First executable test gate for the platform-independent interop core. Runs on any OS
+    (net8.0) so the audited security invariants execute on the Linux CI runner. It compiles the
+    PORTABLE source files into the test assembly (so internal members are directly testable) and
+    deliberately excludes the System.Windows.Forms / COM-bound files (DataObjectHelper,
+    OutlookDataObject) which cannot run off-Windows. The net472 add-in itself remains covered by
+    ci/compile-check.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>OutlookFileDrag.Core.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- Same version the add-in ships; FileUtility takes a static ILog. -->
+    <PackageReference Include="log4net" Version="3.3.1" />
+    <!-- FileUtility's production overload reads ConfigurationManager.AppSettings. -->
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Portable interop-core source under test. NativeMethods.cs is included for its constants and
+      the FORMATETC/struct definitions: it holds P/Invoke + COM-interface DECLARATIONS only (no
+      System.Windows.Forms dependency), so it compiles under net8.0 and is never invoked at runtime
+      by these tests.
+    -->
+    <Compile Include="..\..\OutlookFileDrag\FileUtility.cs" />
+    <Compile Include="..\..\OutlookFileDrag\ConfigUtil.cs" />
+    <Compile Include="..\..\OutlookFileDrag\FormatEtcEnumerator.cs" />
+    <Compile Include="..\..\OutlookFileDrag\FileGroupDescriptor.cs" />
+    <Compile Include="..\..\OutlookFileDrag\NativeMethods.cs" />
+  </ItemGroup>
+
+</Project>

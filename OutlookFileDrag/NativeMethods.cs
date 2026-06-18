@@ -80,6 +80,11 @@ namespace OutlookFileDrag
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
 
+        //Frees an HGLOBAL from GlobalAlloc; used to release the CF_HDROP medium if its construction
+        //fails before ownership is handed to the drop target.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GlobalFree(IntPtr hMem);
+
         public const uint GMEM_FIXED = 0x0000;
 
         [DllImport("ole32.dll", PreserveSig = false)]
@@ -148,15 +153,6 @@ namespace OutlookFileDrag
             int DUnadvise(int connection);
             [PreserveSig]
             int EnumDAdvise(out IEnumSTATDATA enumAdvise);
-        }
-
-        [ComImport, Guid("00000121-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        public interface IDropSource
-        {
-            [PreserveSig]
-            int QueryContinueDrag([MarshalAs(UnmanagedType.Bool)] bool fEscapePressed, int grfKeyState);
-            [PreserveSig]
-            int GiveFeedback(int dwEffect);
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]

@@ -191,7 +191,9 @@
   -->
   <ItemGroup>
     <Compile Include="DragDropHook.cs" />
+    <Compile Include="ConfigUtil.cs" />
     <Compile Include="DataObjectHelper.cs" />
+    <Compile Include="FileGroupDescriptor.cs" />
     <Compile Include="FileUtility.cs" />
     <Compile Include="FormatEtcEnumerator.cs" />
     <Compile Include="NativeMethods.cs" />
@@ -204,7 +206,6 @@
     <None Include="App.config">
       <SubType>Designer</SubType>
     </None>
-    <None Include="OutlookFileDrag.pfx" />
     <None Include="packages.config">
       <SubType>Designer</SubType>
     </None>

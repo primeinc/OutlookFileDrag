@@ -14,8 +14,9 @@ namespace OutlookFileDrag
 
         public void Clone(out IEnumFORMATETC newEnum)
         {
-            //Create new enumerators
-            newEnum = new FormatEtcEnumerator(formats);
+            //Per IEnumFORMATETC::Clone, the new enumerator must carry the same enumeration state
+            //(current position) as this one. index is private but accessible within the type.
+            newEnum = new FormatEtcEnumerator(formats) { index = this.index };
         }
 
         public int Next(int celt, FORMATETC[] rgelt, int[] pceltFetched)
@@ -51,15 +52,21 @@ namespace OutlookFileDrag
 
         public int Skip(int celt)
         {
-            //Check if incremented index is past end of formats
-            if (index + celt > formats.Length - 1)
-                return NativeMethods.S_FALSE;
-            else
+            //Per IEnumFORMATETC::Skip, S_OK iff exactly celt items were skipped; otherwise S_FALSE
+            //with the position left at the end. celt is a COM ULONG, so a value > int.MaxValue
+            //marshals to a negative int; interpret it as unsigned and compute the target in 64-bit so
+            //a huge/overflowing count cannot wrap the bound check and drive index negative (which
+            //would make the next Next() read out of bounds). (The previous "Length - 1" bound also
+            //wrongly reported S_FALSE when skipping exactly to the end.)
+            long target = (long)index + (uint)celt;
+            if (target > formats.Length)
             {
-                //Increment index and return
-                index += celt;
-                return NativeMethods.S_OK;
+                index = formats.Length;
+                return NativeMethods.S_FALSE;
             }
+
+            index += celt;
+            return NativeMethods.S_OK;
         }
     }
 }

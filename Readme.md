@@ -60,6 +60,7 @@ locally and in CI. List them with `just`:
 | --- | --- | --- |
 | `just version` | any OS | Print the MinVer-derived version (from git tags). |
 | `just compile-check` | any OS | `dotnet build` of the platform-independent interop core (`ci/compile-check/`) — a fast compile gate, no Visual Studio. |
+| `just test` | any OS | `dotnet test` of the portable interop-core unit tests (`tests/`) — path-containment, descriptor-count, and `IEnumFORMATETC` invariants. |
 | `just build` | Windows | Builds the VSTO add-in with MSBuild (signs the ClickOnce manifest with an ephemeral self-signed cert), version-stamped from MinVer. |
 | `just msi [version]` | Windows | Builds the x86 + x64 MSIs with WiX into `dist/` (version from MinVer unless one is given). |
 | `just release [version]` | Windows | `build` then `msi` — the full set of artifacts. |
@@ -91,15 +92,16 @@ into the git-ignored `OutlookFileDrag/Properties/VersionInfo.cs` by `just build`
 
 **CI / releases** (`.github/workflows/`)
 
-- `ci.yml` — the Linux `compile-check` on every push/PR; the full Windows add-in + MSI build (`build-windows.yml`, on `windows-2022`) on pushes to `master` / `release/**` only (gated off PRs to keep them fast). Release tags are covered by `release.yml`.
+- `ci.yml` — on every push/PR the Linux job compiles the interop core (`compile-check`) **and** runs the portable unit tests (`dotnet test`); the full Windows add-in + MSI build (`build-windows.yml`, on `windows-2022`) runs on pushes to `master` / `release/**` only (gated off PRs to keep them fast). Release tags are covered by `release.yml`.
 - `release.yml` — on a pushed `v*` tag: builds the MSIs (version derived from the tag by MinVer) and publishes a GitHub Release with them attached.
 
 ## Installation
 
-To install, run the installer that matches your Windows build:
+Download the MSI that matches your Windows build from the
+[Releases page](https://github.com/primeinc/OutlookFileDrag/releases/latest) and run it:
 
-- [Download for 64-bit Windows (Outlook 32-bit or 64-bit)](https://github.com/tonyfederer/OutlookFileDrag/releases/download/v1.0.11/OutlookFileDragSetup_x64.zip)
-- [Download for 32-bit Windows](https://github.com/tonyfederer/OutlookFileDrag/releases/download/v1.0.11/OutlookFileDragSetup.zip)
+- `OutlookFileDrag-<version>-x64.msi` — 64-bit Windows (Outlook 32-bit or 64-bit)
+- `OutlookFileDrag-<version>-x86.msi` — 32-bit Windows
 
 After installing, restart Outlook for the add-in to take effect.
 
@@ -116,36 +118,35 @@ To silently install OutlookFileDrag, use this command:
 - `<pathtomsi>`: Path to MSI file
 - `<pathtolog>`: Path to log file (if folder is not specified, MSI path is used)
 
-Example: 
+Example:
 
-`msiexec.exe C:\Install\OutlookFileDrag_x64.msi /qn /log C:\Logs\OutlookFileDragInstall.log`
+`msiexec.exe /i C:\Install\OutlookFileDrag-1.2.3-x64.msi /qn /log C:\Logs\OutlookFileDragInstall.log`
 
 After installing, restart Outlook for the add-in to take effect.
 
 ### Silent Uninstallation
 
-To silently uninstall OutlookFileDrag, use this command:
+The MSI uses a per-build `ProductCode`, so uninstall with the same MSI file used to install
+(or by the product's stable `UpgradeCode`):
 
-`msiexec.exe /x <productcode> /qn /log <pathtolog>`
+`msiexec.exe /x C:\Install\OutlookFileDrag-1.2.3-x64.msi /qn /log C:\Logs\OutlookFileDragUninstall.log`
 
-- `<productcode>` for 64-bit version: `{CF5F9043-967C-400D-B6D5-F41AF6AD83AE}`
-- `<productcode>` for 32-bit version: `{7EA6E17B-8802-4E1F-9669-248670B31BFB}`
-- `<logfile>`: Path to log file
-
-Example:
-
-`msiexec.exe /x {CF5F9043-967C-400D-B6D5-F41AF6AD83AE} /qn /log C:\Logs\OutlookFileDragUninstall.log`
+Stable `UpgradeCode`s for scripted removal: 64-bit `{65870D9B-6652-4150-830B-C5199F26E62C}`,
+32-bit `{2F626147-8F83-4FC1-9190-32AA4F25D487}`.
 
 ## Acknowledgements
 
 Outlook File Drag uses these open source projects:
 
-- [Easyhook](https://easyhook.github.io/)
 - [log4net](http://logging.apache.org/log4net/)
+
+Drag interception is performed by an in-process `ole32!DoDragDrop` import-address-table (IAT)
+redirect (see [`docs/AUDIT-IAT-REDIRECT.md`](docs/AUDIT-IAT-REDIRECT.md)); the earlier EasyHook
+dependency has been removed.
 
 ## Feedback/Contribute
 
-You can view the source code, report issues, and contribute on [Github](https://github.com/tonyfederer/OutlookFileDrag).
+You can view the source code, report issues, and contribute on [GitHub](https://github.com/primeinc/OutlookFileDrag).
 
 ## Donate
 
@@ -199,4 +200,5 @@ If you find this project useful, please consider donating.  Your donations are a
 
 ## Copyright
 
-Outlook File Drag is copyright (c) 2018 by [Tony Federer](https://github.com/tonyfederer) and released under the MIT License.
+Outlook File Drag is copyright (c) 2018 [Tony Federer](https://github.com/tonyfederer), with fork
+updates (c) 2019–2020 Four Pillar Productions / primeinc, and is released under the MIT License.

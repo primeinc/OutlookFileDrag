@@ -1,9 +1,9 @@
 name: CI
 
 # Two jobs:
-#  - compile-check: the platform-independent interop core on Linux (fast; runs on
-#    every push and PR so breakage in the audit-critical native code is caught
-#    without a Windows runner).
+#  - compile-check: compiles the platform-independent interop core (net472) AND runs the
+#    portable unit tests (net8.0) on Linux (fast; runs on every push and PR so breakage in
+#    the audit-critical native code is caught without a Windows runner).
 #  - build-windows: the full VSTO add-in + WiX MSIs. This is the slow/expensive
 #    job, so it is gated to the release line -- pushes to `master` and
 #    `release/**` -- and does NOT run on pull requests. Release tags are covered
@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   compile-check:
-    name: Interop core compile check (Linux)
+    name: Interop core compile + test (Linux)
     runs-on: ubuntu-latest
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
@@ -38,6 +38,9 @@ jobs:
 
       - name: Build interop core (net472 via reference assemblies)
         run: dotnet build ci/compile-check/OutlookFileDrag.Core.CompileCheck.csproj -c Release
+
+      - name: Test interop core (portable logic, net8.0)
+        run: dotnet test tests/OutlookFileDrag.Core.Tests/OutlookFileDrag.Core.Tests.csproj -c Release
 
   build-windows:
     name: Add-in + MSIs (Windows)
