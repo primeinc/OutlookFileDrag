@@ -55,6 +55,7 @@
   <ItemGroup>
     <!-- The VSTO-free interop core (everything except ThisAddIn*). -->
     <Compile Include="..\..\OutlookFileDrag\NativeMethods.cs" />
+    <Compile Include="..\..\OutlookFileDrag\ConfigUtil.cs" />
     <Compile Include="..\..\OutlookFileDrag\DragDropHook.cs" />
     <Compile Include="..\..\OutlookFileDrag\DataObjectHelper.cs" />
     <Compile Include="..\..\OutlookFileDrag\OutlookDataObject.cs" />

@@ -71,12 +71,13 @@ namespace OutlookFileDrag
 
             string leaf = GetSafeLeafName(descriptorName, replaceSpecialChars);
 
-            // Validate containment on the FINAL target. GetUniqueFilename may truncate to MAX_PATH or
-            // append a "(n)" suffix, so checking only the pre-transform candidate would leave a gap;
-            // re-checking the returned path makes containment hold by construction regardless of those
-            // transforms. ("../" is normalized by GetFullPath and Path.Combine does not contain; a
-            // separator-free leaf of "." or ".." is caught here too.)
-            string target = GetUniqueFilename(Path.GetFullPath(Path.Combine(tempRoot, leaf)));
+            // Build + uniquify WITHOUT normalizing the (possibly over-long) combined path first.
+            // GetUniqueFilename shortens the NAME component to fit MAX_PATH using string operations, so
+            // the result is short enough that the subsequent Path.GetFullPath cannot throw
+            // PathTooLongException on .NET Framework (which enforces MAX_PATH=260 unless the app opts
+            // into long paths). Containment is then validated on the FINAL, bounded path -- covering
+            // any truncation / "(n)" uniqueness suffixing, and a "." / ".." leaf.
+            string target = GetUniqueFilename(Path.Combine(tempRoot, leaf));
             if (!Path.GetFullPath(target).StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException(
                     string.Format("Refusing to extract '{0}': resolved path '{1}' is outside temp folder '{2}'",
@@ -97,6 +98,11 @@ namespace OutlookFileDrag
             int sep = descriptorName.LastIndexOfAny(new char[] { '\\', '/' });
             string leaf = sep >= 0 ? descriptorName.Substring(sep + 1) : descriptorName;
             if (string.IsNullOrEmpty(leaf))
+                leaf = "OutlookFileDrag";
+
+            // "." and ".." are relative path components, never filenames -- collapse so they can never
+            // combine to the temp root or its parent.
+            if (leaf == "." || leaf == "..")
                 leaf = "OutlookFileDrag";
 
             if (!replaceSpecialChars)

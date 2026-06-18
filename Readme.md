@@ -146,7 +146,7 @@ dependency has been removed.
 
 ## Feedback/Contribute
 
-You can view the source code, report issues, and contribute on [Github](https://github.com/primeinc/OutlookFileDrag).
+You can view the source code, report issues, and contribute on [GitHub](https://github.com/primeinc/OutlookFileDrag).
 
 ## Donate
 

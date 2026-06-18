@@ -1,52 +1,93 @@
 using System;
+using System.Runtime.InteropServices;
 using OutlookFileDrag;
 using Xunit;
 
 namespace OutlookFileDrag.Core.Tests
 {
-    // Boundary coverage for the untrusted cItems bound check.
+    // Boundary coverage for the untrusted FILEGROUPDESCRIPTOR.cItems bound check. The descriptor size
+    // is derived the same way production derives it (Marshal.SizeOf), so the test cannot go stale if
+    // struct packing or the runtime changes.
     public class FileGroupDescriptorTests
     {
-        private const int Desc = 592;   // representative FILEDESCRIPTORW size
+        private static readonly int Desc = Marshal.SizeOf(typeof(NativeMethods.FILEDESCRIPTORW));
+        private const int CountField = FileGroupDescriptor.CItemsFieldSize;
 
         [Fact]
-        public void ExactFit_Ok()
+        public void ExactFit_DoesNotThrow()
         {
-            FileGroupDescriptor.ValidateCount(FileGroupDescriptor.CItemsFieldSize + 2 * Desc, Desc, 2);
+            // Arrange
+            int buffer = CountField + 2 * Desc;
+
+            // Act
+            Exception ex = Record.Exception(() => FileGroupDescriptor.ValidateCount(buffer, Desc, 2));
+
+            // Assert
+            Assert.Null(ex);
         }
 
         [Fact]
-        public void ZeroItems_Ok()
+        public void ZeroItems_WithOnlyCountField_DoesNotThrow()
         {
-            FileGroupDescriptor.ValidateCount(FileGroupDescriptor.CItemsFieldSize, Desc, 0);
+            // Arrange
+            int buffer = CountField;
+
+            // Act
+            Exception ex = Record.Exception(() => FileGroupDescriptor.ValidateCount(buffer, Desc, 0));
+
+            // Assert
+            Assert.Null(ex);
         }
 
         [Fact]
-        public void OneByteShort_Throws()
+        public void OneByteShortOfTwoDescriptors_Throws()
         {
-            Assert.Throws<InvalidOperationException>(() =>
-                FileGroupDescriptor.ValidateCount(FileGroupDescriptor.CItemsFieldSize + 2 * Desc - 1, Desc, 2));
+            // Arrange
+            int buffer = CountField + 2 * Desc - 1;
+
+            // Act
+            Exception ex = Record.Exception(() => FileGroupDescriptor.ValidateCount(buffer, Desc, 2));
+
+            // Assert
+            Assert.IsType<InvalidOperationException>(ex);
         }
 
         [Fact]
         public void BufferTooSmallForCountField_Throws()
         {
-            Assert.Throws<InvalidOperationException>(() =>
-                FileGroupDescriptor.ValidateCount(3, Desc, 0));
+            // Arrange
+            int buffer = CountField - 1;
+
+            // Act
+            Exception ex = Record.Exception(() => FileGroupDescriptor.ValidateCount(buffer, Desc, 0));
+
+            // Assert
+            Assert.IsType<InvalidOperationException>(ex);
         }
 
         [Fact]
-        public void HugeCount_Throws_WithoutOverflow()
+        public void HugeCount_DoesNotOverflow_Throws()
         {
-            Assert.Throws<InvalidOperationException>(() =>
-                FileGroupDescriptor.ValidateCount(1000, Desc, uint.MaxValue));
+            // Arrange
+            int buffer = 1000;
+
+            // Act
+            Exception ex = Record.Exception(() => FileGroupDescriptor.ValidateCount(buffer, Desc, uint.MaxValue));
+
+            // Assert
+            Assert.IsType<InvalidOperationException>(ex);
         }
 
-        [Fact]
-        public void NonPositiveDescriptorSize_Throws()
+        [Theory]
+        [InlineData(0)]
+        [InlineData(-1)]
+        public void NonPositiveDescriptorSize_Throws(int descriptorSize)
         {
-            Assert.Throws<ArgumentOutOfRangeException>(() =>
-                FileGroupDescriptor.ValidateCount(1000, 0, 1));
+            // Act
+            Exception ex = Record.Exception(() => FileGroupDescriptor.ValidateCount(1000, descriptorSize, 1));
+
+            // Assert
+            Assert.IsType<ArgumentOutOfRangeException>(ex);
         }
     }
 }

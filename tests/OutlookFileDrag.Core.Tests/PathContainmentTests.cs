@@ -6,10 +6,8 @@ using Xunit;
 namespace OutlookFileDrag.Core.Tests
 {
     // Pins the ship-blocking invariant at the SAME method the production write path uses:
-    // OutlookDataObject.ExtractFiles delegates to FileUtility.GetContainedUniqueTarget, which is
-    // exercised directly here. A descriptor-supplied name (untrusted) must never resolve a file
-    // target outside the temp root, regardless of traversal, absolute paths, or Windows-style
-    // separators on a non-Windows host.
+    // OutlookDataObject.ExtractFiles delegates to FileUtility.GetContainedUniqueTarget. An untrusted
+    // descriptor name must never resolve a target outside the temp root.
     public class PathContainmentTests
     {
         private static string NewTempRoot()
@@ -35,14 +33,20 @@ namespace OutlookFileDrag.Core.Tests
         [InlineData("/etc/passwd")]
         [InlineData("\\\\server\\share\\evil")]
         [InlineData("a/../../b/../../../escape")]
-        public void ContainedTarget_StaysUnderRoot(string descriptorName)
+        [InlineData("..")]
+        [InlineData(".")]
+        [InlineData("subdir/..")]
+        public void GetContainedUniqueTarget_NeverEscapesTempRoot(string descriptorName)
         {
+            // Arrange
             string root = NewTempRoot();
             try
             {
+                // Act
                 string target = FileUtility.GetContainedUniqueTarget(root, descriptorName, replaceSpecialChars: false);
-                string full = Path.GetFullPath(target);
-                Assert.StartsWith(FullRootWithSep(root), full, StringComparison.OrdinalIgnoreCase);
+
+                // Assert
+                Assert.StartsWith(FullRootWithSep(root), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase);
             }
             finally { Directory.Delete(root, true); }
         }
@@ -52,46 +56,77 @@ namespace OutlookFileDrag.Core.Tests
         [InlineData("../../evil.exe", "evil.exe")]
         [InlineData("subdir\\name.txt", "name.txt")]
         [InlineData("subdir/name.txt", "name.txt")]
-        public void ContainedTarget_FlattensWindowsAndUnixSeparatorsToLeaf(string descriptorName, string expectedLeaf)
+        public void GetContainedUniqueTarget_FlattensSeparatorsToLeaf(string descriptorName, string expectedLeaf)
         {
+            // Arrange
             string root = NewTempRoot();
             try
             {
+                // Act
                 string target = FileUtility.GetContainedUniqueTarget(root, descriptorName, replaceSpecialChars: false);
+
+                // Assert
                 Assert.Equal(expectedLeaf, Path.GetFileName(target));
             }
             finally { Directory.Delete(root, true); }
         }
 
         [Fact]
-        public void ContainedTarget_ColonSubjectName_DoesNotThrow_AndStaysContained()
+        public void GetContainedUniqueTarget_ColonSubjectName_StaysContained_DoesNotThrow()
         {
+            // Arrange -- ':' is why production avoids Path.GetFileName; normalization must still yield a
+            // contained, non-throwing target.
             string root = NewTempRoot();
             try
             {
-                // ':' is why production avoids Path.GetFileName; with normalization on it must still
-                // produce a contained, non-throwing target.
+                // Act
                 string target = FileUtility.GetContainedUniqueTarget(root, "RE: plan:v2.pdf", replaceSpecialChars: true);
-                string full = Path.GetFullPath(target);
-                Assert.StartsWith(FullRootWithSep(root), full, StringComparison.OrdinalIgnoreCase);
+
+                // Assert
+                Assert.StartsWith(FullRootWithSep(root), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase);
             }
             finally { Directory.Delete(root, true); }
         }
 
         [Fact]
-        public void ContainedTarget_OverlongName_TruncatesNameButStaysContained()
+        public void GetContainedUniqueTarget_OverlongName_TruncatesNameComponent_StaysWithinMaxPath()
         {
+            // Arrange -- a name far past MAX_PATH must be shortened in the NAME component only (never by
+            // cutting directory segments) and must not over-long the path handed to Path.GetFullPath.
             string root = NewTempRoot();
             try
             {
-                // A name far past MAX_PATH must be shortened in its NAME component only, never by
-                // cutting directory segments -- the result stays under the temp root.
                 string longName = new string('a', 500) + ".bin";
+
+                // Act
                 string target = FileUtility.GetContainedUniqueTarget(root, longName, replaceSpecialChars: false);
-                string full = Path.GetFullPath(target);
-                Assert.StartsWith(FullRootWithSep(root), full, StringComparison.OrdinalIgnoreCase);
-                Assert.True(full.Length <= NativeMethods.MAX_PATH, "target exceeds MAX_PATH: " + full.Length);
-                Assert.EndsWith(".bin", full);
+
+                // Assert
+                Assert.StartsWith(FullRootWithSep(root), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase);
+                Assert.True(target.Length <= NativeMethods.MAX_PATH, "target exceeds MAX_PATH: " + target.Length);
+                Assert.EndsWith(".bin", target);
+            }
+            finally { Directory.Delete(root, true); }
+        }
+
+        [Fact]
+        public void GetContainedUniqueTarget_NameCollision_ReturnsDistinctContainedPath()
+        {
+            // Arrange -- the first extraction occupies the target; the second must get a different,
+            // still-contained path.
+            string root = NewTempRoot();
+            try
+            {
+                string first = FileUtility.GetContainedUniqueTarget(root, "report.pdf", replaceSpecialChars: false);
+                File.WriteAllText(first, "x");
+
+                // Act
+                string second = FileUtility.GetContainedUniqueTarget(root, "report.pdf", replaceSpecialChars: false);
+
+                // Assert
+                Assert.NotEqual(first, second);
+                Assert.False(File.Exists(second));
+                Assert.StartsWith(FullRootWithSep(root), Path.GetFullPath(second), StringComparison.OrdinalIgnoreCase);
             }
             finally { Directory.Delete(root, true); }
         }

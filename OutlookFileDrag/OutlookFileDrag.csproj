@@ -191,6 +191,7 @@
   -->
   <ItemGroup>
     <Compile Include="DragDropHook.cs" />
+    <Compile Include="ConfigUtil.cs" />
     <Compile Include="DataObjectHelper.cs" />
     <Compile Include="FileGroupDescriptor.cs" />
     <Compile Include="FileUtility.cs" />
