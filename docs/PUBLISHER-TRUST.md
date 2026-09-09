@@ -70,6 +70,13 @@ or cloud HSM, which the build has to reach at signing time. A signing service
 that exposes a CSP/KSP (for example DigiCert KeyLocker) can back `mage`; one that
 exposes only a SignTool dlib cannot.
 
+`trust-script` already decides this from the certificate: a signer whose Subject
+equals its Issuer is self-signed and gets TrustedPublisher + Root, and anything
+CA-issued gets TrustedPublisher only. Both branches are controlled — the shipping
+certificate renders `'TrustedPublisher','Root'`, a locally minted CA-issued leaf
+renders `'TrustedPublisher'`. So the migration is: buy the certificate, sign with
+it, re-run `trust-deploy`. The Root deployment stops on its own.
+
 Until that is bought and wired in, the self-signed model is what ships, and
 `deploy::trust-deploy` is how it reaches devices.
 
