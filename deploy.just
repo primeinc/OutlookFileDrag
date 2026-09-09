@@ -1,14 +1,19 @@
 # Intune publisher trust for the signed VSTO manifests.
 #
 # Office puts every `vstolocal` add-in through the ClickOnce trust manager. A
-# manifest is trusted only when its signing certificate sits in the machine
-# TrustedPublisher store, or when a user accepted the trust prompt for that exact
-# manifest URL *and* public key. An MDM install is silent, so it can never create
-# the second kind. Until the certificate is deployed the MSI reports Installed and
-# the add-in does not load.
+# manifest is trusted when its signing certificate is in the machine
+# TrustedPublisher store AND its chain validates, or when the user's inclusion
+# list holds an entry for that exact manifest URL *and* public key. Either path
+# alone is sufficient; measured on lab VM 304, see docs/PUBLISHER-TRUST.md. Until
+# one of them is in place the MSI reports Installed and the add-in does not load.
+#
+# An MDM install is silent, so it never produces a trust PROMPT -- but an Intune
+# user-context script writes the inclusion entry directly, which is what
+# inclusion-deploy does. That path needs no machine store, and so no self-signed
+# certificate in Root.
 #
 # The inclusion-list entry is keyed on URL and key together, so changing either the
-# install directory or the signing certificate revokes every prior user decision.
+# install directory or the signing certificate revokes every prior grant.
 #
 # `az` authenticates these recipes; point AZURE_CONFIG_DIR at the profile holding
 # the Intune credential before running the trust-* recipes.
@@ -36,8 +41,28 @@ export CERT_OUT := "dist/OutlookFileDrag-publisher.cer"
 export REMEDIATION := "dist/Install-PublisherTrust.ps1"
 export SCRIPT_NAME := "OutlookFileDrag publisher trust"
 export GRAPH := "https://graph.microsoft.com/beta"
-# adadadad-… is Intune's built-in All Devices virtual group.
+# adadadad-… is Intune's built-in All Devices virtual group, acacacac-… All Users.
 export ALL_DEVICES := "adadadad-808e-44e2-905a-0b7873a8a531"
+export ALL_USERS := "acacacac-9df4-4c7d-9d50-4ef0226f57a9"
+
+# The per-user trust path. Measured on lab VM 304 with `lab-inclusion`: an entry
+# under HKCU\Software\Microsoft\VSTO\Security\Inclusion earns trust with the
+# certificate in NEITHER machine store and no chain that validates.
+#
+#   machine stores present            VSTOInstaller exit 0
+#   no store, no inclusion            VSTOInstaller exit -300
+#   inclusion only, literal spaces    VSTOInstaller exit 0
+#   inclusion only, escaped spaces    VSTOInstaller exit 0
+#
+# That is what retires the self-signed root. TrustedPublisher plus a validating
+# chain and a per-user inclusion entry are ALTERNATIVE paths to the same trust
+# decision, and only the first requires standing authority to mint certificates
+# on 57 machines. The grant here is the narrowest the platform offers: one
+# manifest URL bound to one public key, and nothing else.
+export INCLUSION_REMEDIATION := "dist/Install-PublisherInclusion.ps1"
+export INCLUSION_NAME := "OutlookFileDrag publisher trust (per-user)"
+export RETIRE_REMEDIATION := "dist/Remove-PublisherTrust.ps1"
+export RETIRE_NAME := "OutlookFileDrag publisher trust (retire machine stores)"
 
 # The probes run under Windows PowerShell, not pwsh: the live add-in check needs
 # Marshal.GetActiveObject, which .NET Core dropped.
@@ -292,10 +317,11 @@ trust-audit: cert-export
 [no-exit-message]
 [windows]
 [script]
-trust-status $stale_days='7':
+trust-status $stale_days='7' $script_name=SCRIPT_NAME:
     $ErrorActionPreference = 'Stop'
     $graph = $env:GRAPH
     $staleDays = [int]$env:stale_days
+    $name = $env:script_name
     # A failed `az rest` emits nothing, which an unguarded pipeline reports as an
     # empty tenant. Absence and no-permission must not print the same line.
     function Invoke-Graph([string]$url) {
@@ -317,12 +343,27 @@ trust-status $stale_days='7':
         $all
     }
     $script = (Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts") |
-        Where-Object { $_.displayName -eq $env:SCRIPT_NAME } | Select-Object -First 1
-    if (-not $script) { "no script named '$($env:SCRIPT_NAME)' in this tenant"; exit 1 }
-    "script     : $($script.id)"
+        Where-Object { $_.displayName -eq $name } | Select-Object -First 1
+    if (-not $script) { "no script named '$name' in this tenant"; exit 1 }
+    "script     : $($script.id) ($($script.runAsAccount) context)"
     # "awaiting" is only meaningful against how long it has been waiting.
     "assigned   : $($script.lastModifiedDateTime)"
     $states = Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts/$($script.id)/deviceRunStates?`$expand=managedDevice"
+    # A user-context script may report under userRunStates instead. An empty
+    # deviceRunStates would then print a fleet where nothing ran, which is a
+    # false zero, not a result. Say so and refuse rather than draw the ledger.
+    if (-not $states) {
+        $users = Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts/$($script.id)/userRunStates"
+        if ($users) {
+            "deviceRunStates is empty but userRunStates holds $($users.Count) entries:"
+            $users | Group-Object -Property { "$($_.successDeviceCount) ok / $($_.errorDeviceCount) error" } |
+                ForEach-Object { "  {0,-28} {1} user(s)" -f $_.Name, $_.Count }
+            ""
+            "this script reports PER USER; the per-device ledger cannot close it"
+            exit 2
+        }
+    }
+    "run states : $($states.Count)"
     # The population is every Windows device: the script is assigned to All Devices
     # and the agent that runs platform scripts is Windows-only.
     $fleet = Invoke-GraphAll "$graph/deviceManagement/managedDevices?`$filter=operatingSystem eq 'Windows'&`$select=id,deviceName,lastSyncDateTime"
@@ -365,6 +406,314 @@ trust-status $stale_days='7':
     "resolved   : $($ledger.Count - $open.Count) of $($ledger.Count) succeeded"
     if ($open) { exit 1 }
 
+
+# Render the device-side script that grants trust from HKCU alone.
+#
+# It carries the shipping certificate as one base64 literal, exactly like
+# trust-script, so `Get-DeployedThumbprint` reads this script's binding too.
+# Everything else is derived on the device: the manifest URL comes from the
+# machine add-in registration, so the entry names whatever path the MSI actually
+# installed to, and the public key is computed from the carried certificate.
+[doc('Generate the per-user inclusion-list script (no machine store)')]
+[group('trust')]
+[windows]
+[script]
+inclusion-script: cert-export
+    $ErrorActionPreference = 'Stop'
+    $cer = [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:CERT_OUT))
+    $out = $env:INCLUSION_REMEDIATION
+    $signer = New-Object Security.Cryptography.X509Certificates.X509Certificate2 $env:CERT_OUT
+    "signer     : $($signer.Subject)"
+    "thumbprint : $($signer.Thumbprint)"
+    "stores     : none -- the grant is one HKCU entry bound to this key and this URL"
+    # No regex: the manifest value is a structured string with a known prefix and
+    # a `|vstolocal` suffix, so Split and Substring read it exactly.
+    $lines = @(
+        "`$ErrorActionPreference = 'Stop'"
+        "`$raw = [Convert]::FromBase64String('$cer')"
+        "`$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(`$raw)"
+        "`$key = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey(`$cert).ToXmlString(`$false)"
+        "`$reg = @("
+        "    'HKLM:\SOFTWARE\Microsoft\Office\Outlook\Addins\OutlookFileDrag'"
+        "    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\Outlook\Addins\OutlookFileDrag'"
+        ")"
+        "`$manifest = `$null"
+        "foreach (`$r in `$reg) {"
+        "    if (-not (Test-Path `$r)) { continue }"
+        "    `$v = (Get-ItemProperty `$r).Manifest"
+        "    if (`$v) { `$manifest = `$v; break }"
+        "}"
+        "if (-not `$manifest) {"
+        "    Write-Output 'OutlookFileDrag is not registered on this machine; nothing to trust'"
+        "    exit 0"
+        "}"
+        "`$path = `$manifest.Split('|')[0]"
+        "if (`$path.StartsWith('file:///')) { `$path = `$path.Substring(8) }"
+        "`$url = 'file:///' + `$path.Replace('\', '/')"
+        "`$base = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion'"
+        # NOT New-Item -Force. On the registry provider, -Force on an EXISTING key
+        # recreates it and deletes every subkey under it -- which here is every
+        # trust grant this user holds, for every VSTO add-in on the machine.
+        # Measured: two back-to-back runs each minted a fresh GUID, because the
+        # second wiped the first before it could look for it.
+        "if (-not (Test-Path `$base)) { New-Item -Path `$base -Force | Out-Null }"
+        # An entry for this URL under a DIFFERENT key is trust for a build this
+        # machine no longer runs. Same reasoning as the store purge in
+        # trust-script: every build machine mints its own key under one subject.
+        "`$hit = `$null"
+        "foreach (`$k in @(Get-ChildItem `$base)) {"
+        "    `$p = Get-ItemProperty `$k.PSPath"
+        "    if (`$p.Url -ne `$url) { continue }"
+        "    if (`$p.PublicKey -eq `$key) { `$hit = `$k.PSChildName; continue }"
+        "    Remove-Item `$k.PSPath -Recurse -Force"
+        "    Write-Output `"removed stale inclusion entry `$(`$k.PSChildName)`""
+        "}"
+        "if (`$hit) {"
+        "    Write-Output `"already trusted: `$hit`""
+        "    exit 0"
+        "}"
+        "`$g = [Guid]::NewGuid().ToString()"
+        "`$new = Join-Path `$base `$g"
+        "New-Item -Path `$new -Force | Out-Null"
+        "New-ItemProperty -Path `$new -Name 'Url' -Value `$url -PropertyType String -Force | Out-Null"
+        "New-ItemProperty -Path `$new -Name 'PublicKey' -Value `$key -PropertyType String -Force | Out-Null"
+        "Write-Output `"granted trust for `$url as `$g`""
+    )
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
+    Set-Content -Path $out -Value $lines -Encoding UTF8
+    $errs = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($out, [ref]$null, [ref]$errs) | Out-Null
+    if ($errs) { throw "generated script does not parse: $($errs[0].Message)" }
+    "written    : $out (parses clean, $($lines.Count) lines)"
+
+# Render the script that takes the machine stores back out.
+#
+# Removal is by SUBJECT, not thumbprint: the point is to leave no OutlookFileDrag
+# publisher certificate in any machine store, including keys from build machines
+# that no longer exist. It carries the shipping certificate anyway so the same
+# binding gate applies to it.
+[doc('Generate the script that removes the machine-store trust')]
+[group('trust')]
+[windows]
+[script]
+retire-script: cert-export
+    $ErrorActionPreference = 'Stop'
+    $cer = [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:CERT_OUT))
+    $out = $env:RETIRE_REMEDIATION
+    $signer = New-Object Security.Cryptography.X509Certificates.X509Certificate2 $env:CERT_OUT
+    "subject    : $($signer.Subject)"
+    "removes    : LocalMachine\TrustedPublisher and LocalMachine\Root"
+    $lines = @(
+        "`$ErrorActionPreference = 'Stop'"
+        "`$raw = [Convert]::FromBase64String('$cer')"
+        "`$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(`$raw)"
+        "foreach (`$name in 'TrustedPublisher', 'Root') {"
+        "    `$store = [System.Security.Cryptography.X509Certificates.X509Store]::new(`$name, 'LocalMachine')"
+        "    `$store.Open('ReadWrite')"
+        "    `$gone = 0"
+        "    foreach (`$c in @(`$store.Certificates | Where-Object { `$_.Subject -eq `$cert.Subject })) {"
+        "        `$store.Remove(`$c)"
+        "        `$gone++"
+        "        Write-Output `"removed `$(`$c.Thumbprint) from LocalMachine\`$name`""
+        "    }"
+        "    if (-not `$gone) { Write-Output `"nothing to remove from LocalMachine\`$name`" }"
+        "    `$store.Close()"
+        "}"
+    )
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
+    Set-Content -Path $out -Value $lines -Encoding UTF8
+    $errs = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($out, [ref]$null, [ref]$errs) | Out-Null
+    if ($errs) { throw "generated script does not parse: $($errs[0].Message)" }
+    "written    : $out (parses clean, $($lines.Count) lines)"
+
+# Publish the per-user grant. Same binding gate as trust-deploy: nothing targets
+# a population until the key inside the uploaded script equals the key inside the
+# shipping artifact.
+[doc('Publish the per-user inclusion grant to Intune (all users, user context)')]
+[group('trust')]
+[confirm("Deploy the per-user OutlookFileDrag trust grant to every managed user. Continue?")]
+[windows]
+[script]
+inclusion-deploy: inclusion-script
+    $ErrorActionPreference = 'Stop'
+    $graph = $env:GRAPH
+    $name = $env:INCLUSION_NAME
+    $content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:INCLUSION_REMEDIATION))
+    function Invoke-Graph([string]$url) {
+        $out = az rest --method get --url $url --output json
+        if ($LASTEXITCODE -ne 0) {
+            throw "graph GET failed (az exit $LASTEXITCODE): $url`nPoint AZURE_CONFIG_DIR at the profile holding the Intune credential; this call needs DeviceManagementScripts.Read.All."
+        }
+        $out | ConvertFrom-Json
+    }
+    $existing = (Invoke-Graph "$graph/deviceManagement/deviceManagementScripts").value |
+        Where-Object { $_.displayName -eq $name } | Select-Object -First 1
+    $payload = @{
+        '@odata.type'         = '#microsoft.graph.deviceManagementScript'
+        displayName           = $name
+        description           = 'Grants OutlookFileDrag ClickOnce trust from the per-user VSTO inclusion list. No certificate is written to any machine store.'
+        scriptContent         = $content
+        runAsAccount          = 'user'
+        enforceSignatureCheck = $false
+        fileName              = 'Install-PublisherInclusion.ps1'
+        runAs32Bit            = $false
+    }
+    $tmp = New-TemporaryFile
+    ($payload | ConvertTo-Json -Depth 5) | Set-Content -Path $tmp -Encoding UTF8
+    if ($existing) {
+        az rest --method patch --url "$graph/deviceManagement/deviceManagementScripts/$($existing.id)" `
+            --headers 'Content-Type=application/json' --body "@$tmp" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "patch failed (az exit $LASTEXITCODE) for script $($existing.id)" }
+        $id = $existing.id
+        "updated script $id"
+    } else {
+        $created = az rest --method post --url "$graph/deviceManagement/deviceManagementScripts" `
+            --headers 'Content-Type=application/json' --body "@$tmp" --output json | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or -not $created.id) { throw "create failed (az exit $LASTEXITCODE)" }
+        $id = $created.id
+        "created script $id"
+    }
+    Remove-Item $tmp -Force
+    Invoke-Expression $env:binding_src
+    $artifact = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $env:CERT_OUT).Thumbprint
+    $deployed = Get-DeployedThumbprint $graph $id
+    "artifact   : $artifact"
+    "deployed   : $deployed"
+    if ($artifact -ne $deployed) {
+        throw "REFUSING TO ASSIGN: the uploaded script carries $deployed, the artifact at $($env:MSI_SOURCE) is signed by $artifact"
+    }
+    "binding OK, assigning"
+    $assign = @{ deviceManagementScriptGroupAssignments = @(
+            @{ '@odata.type' = '#microsoft.graph.deviceManagementScriptGroupAssignment'
+                targetGroupId = $env:ALL_USERS
+            }
+        )
+    }
+    $tmp2 = New-TemporaryFile
+    ($assign | ConvertTo-Json -Depth 5) | Set-Content -Path $tmp2 -Encoding UTF8
+    az rest --method post --url "$graph/deviceManagement/deviceManagementScripts/$id/assign" `
+        --headers 'Content-Type=application/json' --body "@$tmp2" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "assign failed (az exit $LASTEXITCODE) for script $id" }
+    Remove-Item $tmp2 -Force
+    "assigned to All Users"
+
+# Take the self-signed certificate back out of the machine stores.
+#
+# ORDER IS LOAD-BEARING. Removing the machine stores while a user has no
+# inclusion entry withdraws trust from that user: measured, exit -300. This
+# refuses to run until the per-user grant has succeeded everywhere the machine
+# script did, so the fleet is never between two models.
+[doc('Retire the machine-store trust once the per-user grant has landed')]
+[group('trust')]
+[confirm("Remove the OutlookFileDrag publisher certificate from TrustedPublisher AND Root on every managed device. The per-user grant must already cover them. Continue?")]
+[no-exit-message]
+[windows]
+[script]
+retire-deploy: retire-script
+    $ErrorActionPreference = 'Stop'
+    $graph = $env:GRAPH
+    function Invoke-Graph([string]$url) {
+        $out = az rest --method get --url $url --output json
+        if ($LASTEXITCODE -ne 0) { throw "graph GET failed (az exit $LASTEXITCODE): $url" }
+        $out | ConvertFrom-Json
+    }
+    function Invoke-GraphAll([string]$url) {
+        $all = @()
+        while ($url) {
+            $page = Invoke-Graph $url
+            $all += $page.value
+            $url = $page.'@odata.nextLink'
+        }
+        $all
+    }
+    $scripts = Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts"
+    # GATE: the replacement must be in place and reporting success before the
+    # thing it replaces is removed. A grant that was merely UPLOADED proves
+    # nothing about the devices.
+    $grant = $scripts | Where-Object { $_.displayName -eq $env:INCLUSION_NAME } | Select-Object -First 1
+    if (-not $grant) {
+        "REFUSING: no script named '$($env:INCLUSION_NAME)' in this tenant."
+        "Run `just deploy::inclusion-deploy` and let it land before retiring the stores."
+        exit 1
+    }
+    $old = $scripts | Where-Object { $_.displayName -eq $env:SCRIPT_NAME } | Select-Object -First 1
+    $grantStates = @(Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts/$($grant.id)/deviceRunStates?`$expand=managedDevice")
+    if (-not $grantStates) {
+        $grantUsers = @(Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts/$($grant.id)/userRunStates")
+        "REFUSING: the per-user grant has no device run states yet ($($grantUsers.Count) user states)."
+        "Nothing has confirmed it ran, so removing the machine stores would withdraw trust."
+        exit 1
+    }
+    $ok = @($grantStates | Where-Object { $_.runState -eq 'success' -and $_.managedDevice.id })
+    $covered = @{}
+    foreach ($s in $ok) { $covered[$s.managedDevice.id] = $true }
+    "per-user grant : $($grant.id), $($covered.Count) device(s) succeeded"
+    # The devices that must be covered are the ones the machine script reached.
+    # Those are exactly the machines carrying a certificate this would remove.
+    $need = @()
+    if ($old) {
+        $oldStates = @(Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts/$($old.id)/deviceRunStates?`$expand=managedDevice")
+        $need = @($oldStates | Where-Object { $_.runState -eq 'success' -and $_.managedDevice.id })
+        "machine script : $($old.id), $($need.Count) device(s) carry the certificate"
+    }
+    $gap = @($need | Where-Object { -not $covered[$_.managedDevice.id] })
+    if ($gap) {
+        ""
+        "REFUSING: $($gap.Count) device(s) hold the machine-store trust with no per-user grant:"
+        $gap | ForEach-Object { "  $($_.managedDevice.deviceName)" }
+        ""
+        "Removing the stores now would leave Office refusing to load the add-in there."
+        exit 1
+    }
+    "coverage OK: every device carrying the certificate has the per-user grant"
+    $name = $env:RETIRE_NAME
+    $content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:RETIRE_REMEDIATION))
+    $existing = $scripts | Where-Object { $_.displayName -eq $name } | Select-Object -First 1
+    $payload = @{
+        '@odata.type'         = '#microsoft.graph.deviceManagementScript'
+        displayName           = $name
+        description           = 'Removes the OutlookFileDrag publisher certificate from the machine stores. Trust comes from the per-user inclusion list instead.'
+        scriptContent         = $content
+        runAsAccount          = 'system'
+        enforceSignatureCheck = $false
+        fileName              = 'Remove-PublisherTrust.ps1'
+        runAs32Bit            = $false
+    }
+    $tmp = New-TemporaryFile
+    ($payload | ConvertTo-Json -Depth 5) | Set-Content -Path $tmp -Encoding UTF8
+    if ($existing) {
+        az rest --method patch --url "$graph/deviceManagement/deviceManagementScripts/$($existing.id)" `
+            --headers 'Content-Type=application/json' --body "@$tmp" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "patch failed (az exit $LASTEXITCODE) for script $($existing.id)" }
+        $id = $existing.id
+        "updated script $id"
+    } else {
+        $created = az rest --method post --url "$graph/deviceManagement/deviceManagementScripts" `
+            --headers 'Content-Type=application/json' --body "@$tmp" --output json | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or -not $created.id) { throw "create failed (az exit $LASTEXITCODE)" }
+        $id = $created.id
+        "created script $id"
+    }
+    Remove-Item $tmp -Force
+    $assign = @{ deviceManagementScriptGroupAssignments = @(
+            @{ '@odata.type' = '#microsoft.graph.deviceManagementScriptGroupAssignment'
+                targetGroupId = $env:ALL_DEVICES
+            }
+        )
+    }
+    $tmp2 = New-TemporaryFile
+    ($assign | ConvertTo-Json -Depth 5) | Set-Content -Path $tmp2 -Encoding UTF8
+    az rest --method post --url "$graph/deviceManagement/deviceManagementScripts/$id/assign" `
+        --headers 'Content-Type=application/json' --body "@$tmp2" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "assign failed (az exit $LASTEXITCODE) for script $id" }
+    Remove-Item $tmp2 -Force
+    "assigned to All Devices"
+    if ($old) {
+        ""
+        "the machine-store script $($old.id) is still assigned; unassign it in Intune so it"
+        "does not put the certificate back on the next cycle"
+    }
 # Report whether Office will load the add-in here, and why. Exit 0 trusted, 1 not.
 [doc('Diagnose add-in trust on the current machine')]
 [group('verify')]
@@ -389,7 +738,11 @@ lab-push $vm:
     $ErrorActionPreference = 'Stop'
     $lines = @("`$d = 'C:\ProgramData\ofd-probe'", "New-Item -ItemType Directory -Force -Path `$d | Out-Null")
     $expect = @{}
-    foreach ($p in $env:PROBE, $env:CONTROL) {
+    # INCLUSION_REMEDIATION is the generated production script; it only exists
+    # after `inclusion-script` has run, and lab-inclusion-prod needs the exact
+    # bytes Intune will carry rather than a re-implementation of them.
+    foreach ($p in $env:PROBE, $env:CONTROL, $env:INCLUSION_REMEDIATION) {
+        if (-not (Test-Path $p)) { continue }
         $name = [IO.Path]::GetFileName($p)
         $expect[$name] = (Get-FileHash $p -Algorithm SHA256).Hash
         $raw = [IO.File]::ReadAllBytes($p)
@@ -652,3 +1005,374 @@ lab-store-matrix $vm=LAB_VM: (lab-push vm)
     } else {
         "TrustedPublisher is required: a validating chain alone does not earn silent trust"
     }
+
+# Can trust come from the PER-USER inclusion list alone, with nothing in any
+# machine store?
+#
+# Office has a third trust path beside TrustedPublisher and a validating chain:
+# HKCU\Software\Microsoft\VSTO\Security\Inclusion. Windows writes an entry there
+# when a user accepts a trust prompt. Each entry is a GUID-named key holding two
+# REG_SZ values -- Url, the deployment manifest with forward slashes and no
+# |vstolocal suffix, and PublicKey, RSA.ToXmlString($false) of the signer's
+# public key. Both are derivable from the shipping manifest, so the entry can be
+# written instead of prompted for.
+#
+# If it earns trust, publisher trust needs no machine store write at all: no
+# TrustedPublisher, and above all no self-signed certificate in Root. That is
+# the zero-cost alternative to a purchased signing certificate.
+#
+# The URL spelling of a path containing spaces is the open variable -- the
+# entries Windows wrote here were for space-free paths, and the deployed path is
+# C:\Program Files\4pp\Outlook File Drag. Both spellings are tried.
+#
+# Same two transports and the same restore-in-finally as lab-store-matrix.
+[doc('Can HKCU alone earn trust, with no machine store? (lab VM)')]
+[group('verify')]
+[confirm("Temporarily remove the publisher certificate from BOTH machine stores on that machine and seed a per-user trust entry, restoring both after. Lab machines only. Continue?")]
+[no-exit-message]
+[windows]
+[script]
+lab-inclusion $vm=LAB_VM: (lab-push vm)
+    $ErrorActionPreference = 'Stop'
+    $jf = "$env:MO_REPO/justfile"
+    function Invoke-Guest([string] $Recipe, [string] $Ps) {
+        $out = $Ps | & just --justfile $jf --working-directory $env:MO_REPO lab $Recipe $env:vm
+        if ($LASTEXITCODE -ne 0) { throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)" }
+        $out
+    }
+    function Invoke-Arm([string] $Tag) {
+        Write-Host ""
+        Write-Host "########## $Tag ##########"
+        $out = Invoke-Guest 'intune-user-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Check-AddInTrust.ps1' -SinceHours 1"
+        $out | ForEach-Object { Write-Host "  $_" }
+        $line = @($out | Where-Object { $_ -like 'INSTALLER:*' })
+        if (-not $line) { return 'none' }
+        $line[-1].Split(':')[1].Trim()
+    }
+    $read = @(
+        "`$p = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\Outlook\Addins\OutlookFileDrag').Manifest"
+        "`$m = `$p.Split('|')[0].Replace('file:///', '').Replace('/', '\')"
+        "`$doc = New-Object System.Xml.XmlDocument"
+        "`$doc.Load(`$m)"
+        "`$ns = New-Object System.Xml.XmlNamespaceManager(`$doc.NameTable)"
+        "`$ns.AddNamespace('ds', 'http://www.w3.org/2000/09/xmldsig#')"
+        "`$n = `$doc.SelectSingleNode('//ds:Signature/ds:KeyInfo/ds:X509Data/ds:X509Certificate', `$ns)"
+        "`$c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String(`$n.InnerText.Trim()))"
+        "'THUMB: ' + `$c.Thumbprint"
+    )
+    $thumb = @(Invoke-Guest 'intune-ps' ($read -join "`n") | Where-Object { $_ -like 'THUMB:*' })
+    if (-not $thumb) { throw "could not read the manifest signer on vm $env:vm" }
+    $thumb = $thumb[0].Split(':')[1].Trim()
+    "signer under test : $thumb"
+
+    # Built in the guest from the guest's own registration, so the Url compared
+    # against is the one Office resolves, not one assembled on this workstation.
+    function Get-SeedPayload([string] $Encoding) {
+        $l = @("`$p = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\Outlook\Addins\OutlookFileDrag').Manifest")
+        $l += "`$path = `$p.Split('|')[0].Replace('file:///', '').Replace('/', '\')"
+        $l += "`$url = 'file:///' + `$path.Replace('\', '/')"
+        if ($Encoding -eq 'escaped') { $l += "`$url = `$url.Replace(' ', '%20')" }
+        $l += "`$doc = New-Object System.Xml.XmlDocument"
+        $l += "`$doc.Load(`$path)"
+        $l += "`$ns = New-Object System.Xml.XmlNamespaceManager(`$doc.NameTable)"
+        $l += "`$ns.AddNamespace('ds', 'http://www.w3.org/2000/09/xmldsig#')"
+        $l += "`$n = `$doc.SelectSingleNode('//ds:Signature/ds:KeyInfo/ds:X509Data/ds:X509Certificate', `$ns)"
+        $l += "`$c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String(`$n.InnerText.Trim()))"
+        $l += "`$rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey(`$c)"
+        $l += "`$g = [Guid]::NewGuid().ToString()"
+        $l += "`$k = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion\' + `$g"
+        $l += "New-Item -Path `$k -Force | Out-Null"
+        $l += "New-ItemProperty -Path `$k -Name 'Url' -Value `$url -PropertyType String -Force | Out-Null"
+        $l += "New-ItemProperty -Path `$k -Name 'PublicKey' -Value `$rsa.ToXmlString(`$false) -PropertyType String -Force | Out-Null"
+        $l += "'SEEDED: ' + `$g"
+        $l += "'  url: ' + (Get-ItemProperty `$k).Url"
+        $l -join "`n"
+    }
+    function Get-ClearPayload([string] $Guid) {
+        $l = @("`$k = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion\$Guid'")
+        $l += "if (Test-Path `$k) { Remove-Item `$k -Recurse -Force }"
+        $l += "'cleared $Guid : ' + (-not (Test-Path `$k))"
+        $l -join "`n"
+    }
+    function Get-StorePayload([string] $Verb) {
+        $l = @("foreach (`$n in 'TrustedPublisher', 'Root') {")
+        $l += "    `$f = `"C:\ProgramData\ofd-probe\incl-`$n.cer`""
+        $l += "    `$s = New-Object Security.Cryptography.X509Certificates.X509Store `$n, 'LocalMachine'"
+        if ($Verb -eq 'remove') {
+            $l += "    `$s.Open('ReadWrite')"
+            $l += "    foreach (`$c in @(`$s.Certificates.Find('FindByThumbprint', '$thumb', `$false))) {"
+            $l += "        [IO.File]::WriteAllBytes(`$f, `$c.Export('Cert'))"
+            $l += "        `$s.Remove(`$c)"
+            $l += "        `"removed from LocalMachine\`$n`""
+            $l += "    }"
+        } else {
+            $l += "    if (-not (Test-Path `$f)) { `$s.Dispose(); continue }"
+            $l += "    `$c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 `$f"
+            $l += "    `$s.Open('ReadWrite')"
+            $l += "    if (-not `$s.Certificates.Find('FindByThumbprint', '$thumb', `$false).Count) { `$s.Add(`$c) }"
+            $l += "    Remove-Item `$f -Force"
+            $l += "    `"restored to LocalMachine\`$n : `" + (`$s.Certificates.Find('FindByThumbprint', '$thumb', `$false).Count -gt 0)"
+        }
+        $l += "    `$s.Close()"
+        $l += "}"
+        $l -join "`n"
+    }
+    # An entry left over from an earlier prompt would grant trust on its own and
+    # every arm would read 0, so the run has to start from a known-empty list.
+    $pre = @(Invoke-Guest 'intune-user-ps' "@(if (Test-Path 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion') { Get-ChildItem 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion' }) | ForEach-Object { 'PRE: ' + `$_.PSChildName }" | Where-Object { $_ -like 'PRE:*' })
+    if ($pre) {
+        $pre | ForEach-Object { Write-Host $_ }
+        throw "the inclusion list on vm $env:vm is not empty; a pre-existing entry would decide every arm"
+    }
+    "inclusion list     : empty"
+    $results = [ordered]@{}
+    $results['machine stores present'] = Invoke-Arm 'BASELINE, MACHINE STORES PRESENT'
+    try {
+        Write-Host ""
+        Write-Host "--- removing $thumb from both machine stores (SYSTEM) ---"
+        Invoke-Guest 'intune-ps' (Get-StorePayload 'remove') | ForEach-Object { Write-Host $_ }
+        $results['no store, no inclusion'] = Invoke-Arm 'NO MACHINE STORE, NO INCLUSION'
+        foreach ($enc in 'literal', 'escaped') {
+            $guid = $null
+            try {
+                Write-Host ""
+                Write-Host "--- seeding the per-user inclusion entry, $enc spaces ---"
+                $seeded = Invoke-Guest 'intune-user-ps' (Get-SeedPayload $enc)
+                $seeded | ForEach-Object { Write-Host "  $_" }
+                $line = @($seeded | Where-Object { $_ -like 'SEEDED:*' })
+                if (-not $line) { throw "the inclusion entry was not written on vm $env:vm" }
+                $guid = $line[0].Split(':')[1].Trim()
+                $results["inclusion only, $enc spaces"] = Invoke-Arm "INCLUSION ONLY, $($enc.ToUpper()) SPACES"
+            } finally {
+                if ($guid) { Invoke-Guest 'intune-user-ps' (Get-ClearPayload $guid) | ForEach-Object { Write-Host $_ } }
+            }
+        }
+    } finally {
+        Write-Host ""
+        Write-Host "--- restoring $thumb to both machine stores (SYSTEM) ---"
+        Invoke-Guest 'intune-ps' (Get-StorePayload 'restore') | ForEach-Object { Write-Host $_ }
+    }
+    $results['machine stores restored'] = Invoke-Arm 'MACHINE STORES RESTORED'
+    ""
+    "########## RESULT ##########"
+    foreach ($k in $results.Keys) { "  {0,-30} VSTOInstaller exit {1}" -f $k, $results[$k] }
+    ""
+    if ($results.Values -contains 'none' -or $results.Values -contains '-400') {
+        "INVALID: an arm produced no trust decision"
+        exit 2
+    }
+    if ($results['machine stores present'] -ne '0' -or $results['machine stores restored'] -ne '0') {
+        "INVALID: the baseline arms did not both trust; the machine changed underneath the run"
+        exit 2
+    }
+    if ($results['no store, no inclusion'] -ne '-300') {
+        "INVALID: removing the certificate did not withdraw trust, so the seeded arms control nothing"
+        exit 2
+    }
+    $won = @($results.Keys | Where-Object { $_ -like 'inclusion only*' -and $results[$_] -eq '0' })
+    if ($won) {
+        "PER-USER TRUST EARNS IT ($($won -join '; ')): no machine store write is required"
+        exit 0
+    }
+    "the seeded entry did not earn trust in either URL spelling; the machine store stays"
+    exit 1
+
+# Run the SHIPPING per-user script on a lab guest and ask the trust manager.
+#
+# lab-inclusion proved the mechanism with an inline seed. This proves the
+# artifact: the same bytes inclusion-deploy uploads to Intune are executed in the
+# guest's user session, with the certificate in neither machine store.
+#
+# It also runs the script twice. An Intune platform script re-runs, and a grant
+# that minted a fresh GUID every cycle would fill the hive; the second pass has to
+# say "already trusted" and change nothing.
+[doc('Run the shipping per-user script on a lab VM and verify trust (lab VM)')]
+[group('verify')]
+[confirm("Temporarily remove the publisher certificate from BOTH machine stores on that machine, run the shipping per-user grant, and restore after. Lab machines only. Continue?")]
+[no-exit-message]
+[windows]
+[script]
+lab-inclusion-prod $vm=LAB_VM: inclusion-script (lab-push vm)
+    $ErrorActionPreference = 'Stop'
+    $jf = "$env:MO_REPO/justfile"
+    $remote = 'C:\ProgramData\ofd-probe\' + [IO.Path]::GetFileName($env:INCLUSION_REMEDIATION)
+    function Invoke-Guest([string] $Recipe, [string] $Ps) {
+        $out = $Ps | & just --justfile $jf --working-directory $env:MO_REPO lab $Recipe $env:vm
+        if ($LASTEXITCODE -ne 0) { throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)" }
+        $out
+    }
+    function Invoke-Arm([string] $Tag) {
+        Write-Host ""
+        Write-Host "########## $Tag ##########"
+        $out = Invoke-Guest 'intune-user-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Check-AddInTrust.ps1' -SinceHours 1"
+        $out | ForEach-Object { Write-Host "  $_" }
+        $line = @($out | Where-Object { $_ -like 'INSTALLER:*' })
+        if (-not $line) { return 'none' }
+        $line[-1].Split(':')[1].Trim()
+    }
+    $thumb = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $env:CERT_OUT).Thumbprint
+    "artifact signer : $thumb"
+    "shipping script : $remote"
+    function Get-StorePayload([string] $Verb) {
+        $l = @("foreach (`$n in 'TrustedPublisher', 'Root') {")
+        $l += "    `$f = `"C:\ProgramData\ofd-probe\prod-`$n.cer`""
+        $l += "    `$s = New-Object Security.Cryptography.X509Certificates.X509Store `$n, 'LocalMachine'"
+        if ($Verb -eq 'remove') {
+            $l += "    `$s.Open('ReadWrite')"
+            $l += "    foreach (`$c in @(`$s.Certificates.Find('FindByThumbprint', '$thumb', `$false))) {"
+            $l += "        [IO.File]::WriteAllBytes(`$f, `$c.Export('Cert'))"
+            $l += "        `$s.Remove(`$c)"
+            $l += "        `"removed from LocalMachine\`$n`""
+            $l += "    }"
+        } else {
+            $l += "    if (-not (Test-Path `$f)) { `$s.Dispose(); continue }"
+            $l += "    `$c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 `$f"
+            $l += "    `$s.Open('ReadWrite')"
+            $l += "    if (-not `$s.Certificates.Find('FindByThumbprint', '$thumb', `$false).Count) { `$s.Add(`$c) }"
+            $l += "    Remove-Item `$f -Force"
+            $l += "    `"restored to LocalMachine\`$n : `" + (`$s.Certificates.Find('FindByThumbprint', '$thumb', `$false).Count -gt 0)"
+        }
+        $l += "    `$s.Close()"
+        $l += "}"
+        $l -join "`n"
+    }
+    $clear = @(
+        "`$b = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion'"
+        "if (Test-Path `$b) { Get-ChildItem `$b | Remove-Item -Recurse -Force }"
+        "'inclusion entries: ' + @(if (Test-Path `$b) { Get-ChildItem `$b }).Count"
+    ) -join "`n"
+    $count = "`$b = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion'; 'ENTRIES: ' + @(if (Test-Path `$b) { Get-ChildItem `$b }).Count"
+    function Get-Count {
+        $line = @(Invoke-Guest 'intune-user-ps' $count | Where-Object { $_ -like 'ENTRIES:*' })
+        if (-not $line) { return 'unknown' }
+        $line[0].Split(':')[1].Trim()
+    }
+    Invoke-Guest 'intune-user-ps' $clear | ForEach-Object { Write-Host $_ }
+    $results = [ordered]@{}
+    try {
+        Write-Host ""
+        Write-Host "--- removing $thumb from both machine stores (SYSTEM) ---"
+        Invoke-Guest 'intune-ps' (Get-StorePayload 'remove') | ForEach-Object { Write-Host $_ }
+        $results['no store, no grant'] = Invoke-Arm 'NO MACHINE STORE, NO GRANT'
+        # A grant for an UNRELATED add-in, planted before the passes and checked
+        # after. The inclusion list is shared by every VSTO add-in on the machine,
+        # so a script that rebuilt the parent key would silently revoke trust for
+        # all of them. It did: `New-Item -Force` on an existing registry key
+        # recreates it and drops its subkeys. This is the control for that.
+        Write-Host ""
+        Write-Host "--- planting a decoy grant for an unrelated add-in ---"
+        $decoy = @(
+            "`$b = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion'"
+            "`$k = Join-Path `$b 'decoy-0000-0000-0000-000000000000'"
+            "New-Item -Path `$k -Force | Out-Null"
+            "New-ItemProperty -Path `$k -Name 'Url' -Value 'file:///C:/Decoy/Other.vsto' -PropertyType String -Force | Out-Null"
+            "New-ItemProperty -Path `$k -Name 'PublicKey' -Value 'decoy' -PropertyType String -Force | Out-Null"
+            "'planted decoy'"
+        ) -join "`n"
+        $decoyCheck = "`$k = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion\decoy-0000-0000-0000-000000000000'; 'DECOY: ' + (Test-Path `$k)"
+        Invoke-Guest 'intune-user-ps' $decoy | ForEach-Object { Write-Host "  $_" }
+        # The two passes run back to back, with no probe between them. The probe
+        # is not passive: it installs with VSTOInstaller and uninstalls to clean
+        # up after itself, and that uninstall DELETES the inclusion entry. Probing
+        # between the passes made pass 2 re-grant from an empty hive and read as
+        # non-idempotent when it was not.
+        Write-Host ""
+        Write-Host "--- running the shipping script, pass 1 ---"
+        $p1 = Invoke-Guest 'intune-user-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$remote'"
+        $p1 | ForEach-Object { Write-Host "  $_" }
+        $n1 = Get-Count
+        Write-Host ""
+        Write-Host "--- running the shipping script, pass 2 (idempotence) ---"
+        $p2 = Invoke-Guest 'intune-user-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$remote'"
+        $p2 | ForEach-Object { Write-Host "  $_" }
+        $n2 = Get-Count
+        $granted = ($p1 -join ' ') -like '*granted trust*'
+        $idem = ($p2 -join ' ') -like '*already trusted*'
+        $survived = @(Invoke-Guest 'intune-user-ps' $decoyCheck | Where-Object { $_ -like 'DECOY:*' })
+        $decoyLives = $survived -and $survived[0].Split(':')[1].Trim() -eq 'True'
+        ""
+        "pass 1 granted trust        : $granted"
+        "pass 2 said already trusted : $idem"
+        "entries after pass 1 / 2    : $n1 / $n2 (the decoy is one of them)"
+        "unrelated grant survived    : $decoyLives"
+        $results['after two passes'] = Invoke-Arm 'AFTER TWO PASSES OF THE SHIPPING SCRIPT'
+        # Measure what the probe leaves behind rather than inferring it. A
+        # user-context Intune script re-runs on its own cycle and repairs this,
+        # but the window is real and belongs in the docs.
+        $n3 = Get-Count
+        "entries after the probe     : $n3"
+    } finally {
+        Write-Host ""
+        Write-Host "--- restoring $thumb and clearing the seeded grant ---"
+        Invoke-Guest 'intune-ps' (Get-StorePayload 'restore') | ForEach-Object { Write-Host $_ }
+        Invoke-Guest 'intune-user-ps' $clear | ForEach-Object { Write-Host $_ }
+    }
+    $results['machine stores restored'] = Invoke-Arm 'MACHINE STORES RESTORED'
+    ""
+    "########## RESULT ##########"
+    foreach ($k in $results.Keys) { "  {0,-28} VSTOInstaller exit {1}" -f $k, $results[$k] }
+    ""
+    if ($results.Values -contains 'none' -or $results.Values -contains '-400') {
+        "INVALID: an arm produced no trust decision"
+        exit 2
+    }
+    if ($results['no store, no grant'] -ne '-300') {
+        "INVALID: trust survived removing the certificate, so the grant controls nothing"
+        exit 2
+    }
+    if ($results['machine stores restored'] -ne '0') {
+        "INVALID: the machine did not come back to its starting state"
+        exit 2
+    }
+    if ($results['after two passes'] -ne '0') {
+        "FAIL: the shipping script did not earn trust from HKCU alone"
+        exit 1
+    }
+    if (-not $granted -or -not $idem -or $n1 -ne '2' -or $n2 -ne '2') {
+        "FAIL: not idempotent -- granted=$granted, already-trusted=$idem, entries $n1 then $n2"
+        exit 1
+    }
+    if (-not $decoyLives) {
+        "FAIL: the grant destroyed an unrelated add-in's trust entry"
+        exit 1
+    }
+    "PASS: the shipping script earns trust with no machine store, is idempotent,"
+    "      and leaves other add-ins' grants alone"
+    "note: VSTOInstaller /Uninstall removes the entry ($n3 left after the probe);"
+    "      the user-context script re-grants on its next cycle"
+
+# Put a lab guest back the way the control recipes found it.
+#
+# The control recipes restore in a `finally`, but a killed process runs no
+# finally: an interrupted run leaves the machine with no publisher certificate in
+# either store. This is idempotent and safe to run at any time.
+[doc('Restore a lab VM after an interrupted control run: lab-restore 304')]
+[group('verify')]
+[no-exit-message]
+[windows]
+[script]
+lab-restore $vm=LAB_VM: cert-export
+    $ErrorActionPreference = 'Stop'
+    $jf = "$env:MO_REPO/justfile"
+    $cer = [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:CERT_OUT))
+    $lines = @(
+        "`$raw = [Convert]::FromBase64String('$cer')"
+        "`$c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,`$raw)"
+        "foreach (`$n in 'TrustedPublisher', 'Root') {"
+        "    `$s = New-Object Security.Cryptography.X509Certificates.X509Store `$n, 'LocalMachine'"
+        "    `$s.Open('ReadWrite')"
+        "    if (-not `$s.Certificates.Find('FindByThumbprint', `$c.Thumbprint, `$false).Count) { `$s.Add(`$c) }"
+        "    `"LocalMachine\`$n holds `$(`$c.Thumbprint) : `" + (`$s.Certificates.Find('FindByThumbprint', `$c.Thumbprint, `$false).Count -gt 0)"
+        "    `$s.Close()"
+        "}"
+        "Get-ChildItem 'C:\ProgramData\ofd-probe' -Filter '*.cer' -ErrorAction SilentlyContinue | Remove-Item -Force"
+    )
+    ($lines -join "`n") | & just --justfile $jf --working-directory $env:MO_REPO lab intune-ps $env:vm
+    if ($LASTEXITCODE -ne 0) { throw "restore on vm $env:vm failed (exit $LASTEXITCODE)" }
+    $clear = @(
+        "`$b = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion'"
+        "if (Test-Path `$b) { Get-ChildItem `$b | Remove-Item -Recurse -Force }"
+        "'inclusion entries: ' + @(if (Test-Path `$b) { Get-ChildItem `$b }).Count"
+    )
+    ($clear -join "`n") | & just --justfile $jf --working-directory $env:MO_REPO lab intune-user-ps $env:vm
+    if ($LASTEXITCODE -ne 0) { throw "clearing the inclusion list on vm $env:vm failed (exit $LASTEXITCODE)" }
