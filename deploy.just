@@ -136,8 +136,23 @@ trust-script: cert-export
     $ErrorActionPreference = 'Stop'
     $cer = [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:CERT_OUT))
     $out = $env:REMEDIATION
-    # The certificate is self-signed, so it is its own chain root. TrustedPublisher
-    # alone leaves the chain unvalidated and the trust manager still refuses.
+    # Which stores this has to write is a property of the CERTIFICATE, not a
+    # constant. Measured with `lab-store-matrix`: TrustedPublisher membership and a
+    # chain that validates are both necessary and neither is sufficient. A
+    # self-signed certificate is its own chain root, so satisfying condition 2 means
+    # installing it as a root -- standing authority to mint trust for anything that
+    # key signs. A CA-issued certificate needs no such thing, and installing one
+    # would be gratuitous. Decide from the certificate.
+    $signer = New-Object Security.Cryptography.X509Certificates.X509Certificate2 $env:CERT_OUT
+    $selfSigned = $signer.Subject -eq $signer.Issuer
+    $stores = if ($selfSigned) { "'TrustedPublisher','Root'" } else { "'TrustedPublisher'" }
+    "signer     : $($signer.Subject)"
+    "issuer     : $($signer.Issuer)"
+    if ($selfSigned) {
+        "stores     : TrustedPublisher + Root (self-signed, so it is its own chain root)"
+    } else {
+        "stores     : TrustedPublisher only (issued by $($signer.Issuer); no root deployment)"
+    }
     # Purge any other certificate under the same subject before adding this one.
     # Every build machine mints its own key under one fixed subject name, so a
     # device can accumulate publisher trust for keys that signed nothing it runs.
@@ -145,7 +160,7 @@ trust-script: cert-export
         "`$ErrorActionPreference = 'Stop'"
         "`$raw = [Convert]::FromBase64String('$cer')"
         "`$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(`$raw)"
-        "foreach (`$name in 'TrustedPublisher','Root') {"
+        "foreach (`$name in $stores) {"
         "    `$store = [System.Security.Cryptography.X509Certificates.X509Store]::new(`$name, 'LocalMachine')"
         "    `$store.Open('ReadWrite')"
         "    foreach (`$old in @(`$store.Certificates | Where-Object { `$_.Subject -eq `$cert.Subject -and `$_.Thumbprint -ne `$cert.Thumbprint })) {"
