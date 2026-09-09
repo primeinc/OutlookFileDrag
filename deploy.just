@@ -95,6 +95,59 @@ function Get-DeployedThumbprint([string] $Graph, [string] $ScriptId) {
 }
 '''
 
+# Which profiles on a machine hold the grant, including users who are not signed
+# in. Runs as SYSTEM: already-loaded hives are read under HKEY_USERS\<sid>, the
+# rest are mounted from NTUSER.DAT and unmounted again.
+#
+# A raw string, not a PowerShell line array: this payload is `$`-dense and every
+# escaping layer is somewhere to lose a branch. Assembled by hand in a shell
+# heredoc, the hive-mount branch silently did nothing and three profiles reported
+# no grant when they had one.
+#
+# Keys are [Microsoft.Win32.Registry] handles disposed in their own finally,
+# never the PowerShell provider: the provider holds handles open, `reg unload`
+# then fails, and A HIVE LEFT MOUNTED BLOCKS THAT USER'S SIGN-IN.
+export audit_src := '''
+$pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+$service = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')
+foreach ($k in @(Get-ChildItem $pl)) {
+    if ($service -contains $k.PSChildName) { continue }
+    $img = (Get-ItemProperty $k.PSPath).ProfileImagePath
+    if (-not $img) { continue }
+    $dat = Join-Path $img 'NTUSER.DAT'
+    if (-not (Test-Path $dat)) { continue }
+    $hive = $k.PSChildName
+    $tmp = $null
+    if (-not (Test-Path "Registry::HKEY_USERS\$hive")) {
+        $tmp = 'AUD-' + $k.PSChildName
+        $out = & reg.exe load "HKU\$tmp" "$dat" 2>&1
+        if ($LASTEXITCODE -ne 0) { "PROFILE: $img : COULD NOT READ ($out)"; continue }
+        $hive = $tmp
+    }
+    try {
+        $urls = @()
+        $b = $null
+        try {
+            $b = [Microsoft.Win32.Registry]::Users.OpenSubKey("$hive\Software\Microsoft\VSTO\Security\Inclusion", $false)
+            if ($b) {
+                foreach ($n in @($b.GetSubKeyNames())) {
+                    $s = $null
+                    try { $s = $b.OpenSubKey($n, $false); if ($s) { $urls += $s.GetValue('Url') } }
+                    finally { if ($s) { $s.Dispose() } }
+                }
+            }
+        } finally { if ($b) { $b.Dispose() } }
+        $ofd = @($urls | Where-Object { $_ -like '*OutlookFileDrag.vsto' })
+        if ($ofd) { "PROFILE: $img : $($ofd[0])" } else { "PROFILE: $img : none" }
+    } finally {
+        if ($tmp) {
+            $uu = & reg.exe unload "HKU\$tmp" 2>&1
+            if ($LASTEXITCODE -ne 0) { "PROFILE: $img : LEFT MOUNTED ($uu)" }
+        }
+    }
+}
+'''
+
 [private]
 default:
     @just --list deploy
@@ -1399,50 +1452,7 @@ lab-inclusion-prod $vm=LAB_VM: inclusion-script (lab-push vm)
             "'planted decoy'"
         ) -join "`n"
         $decoyCheck = "`$k = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion\decoy-0000-0000-0000-000000000000'; 'DECOY: ' + (Test-Path `$k)"
-        $profileAudit = @(
-            "`$pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'"
-            "`$service = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')"
-            "foreach (`$k in @(Get-ChildItem `$pl)) {"
-            "    if (`$service -contains `$k.PSChildName) { continue }"
-            "    `$img = (Get-ItemProperty `$k.PSPath).ProfileImagePath"
-            "    if (-not `$img) { continue }"
-            "    `$dat = Join-Path `$img 'NTUSER.DAT'"
-            "    if (-not (Test-Path `$dat)) { continue }"
-            "    `$hive = `$k.PSChildName"
-            "    `$tmp = `$null"
-            "    if (-not (Test-Path `"Registry::HKEY_USERS\`$hive`")) {"
-            "        `$tmp = 'AUD-' + `$k.PSChildName"
-            "        & reg.exe load `"HKU\`$tmp`" `"`$dat`" 2>&1 | Out-Null"
-            "        if (`$LASTEXITCODE -ne 0) { `"PROFILE: `$img : busy`"; continue }"
-            "        `$hive = `$tmp"
-            "    }"
-            "    try {"
-            # .NET keys with explicit disposal, never the PowerShell provider:
-            # the provider holds its handles open and `reg unload` then fails
-            # with Access denied, leaving the hive mounted and that user unable
-            # to sign in.
-            "        `$urls = @()"
-            "        `$b = `$null"
-            "        try {"
-            "            `$b = [Microsoft.Win32.Registry]::Users.OpenSubKey(`"`$hive\Software\Microsoft\VSTO\Security\Inclusion`", `$false)"
-            "            if (`$b) {"
-            "                foreach (`$n in @(`$b.GetSubKeyNames())) {"
-            "                    `$s = `$null"
-            "                    try { `$s = `$b.OpenSubKey(`$n, `$false); if (`$s) { `$urls += `$s.GetValue('Url') } }"
-            "                    finally { if (`$s) { `$s.Dispose() } }"
-            "                }"
-            "            }"
-            "        } finally { if (`$b) { `$b.Dispose() } }"
-            "        `$ofd = @(`$urls | Where-Object { `$_ -like '*OutlookFileDrag.vsto' })"
-            "        if (`$ofd) { `"PROFILE: `$img : `$(`$ofd[0])`" } else { `"PROFILE: `$img : none`" }"
-            "    } finally {"
-            "        if (`$tmp) {"
-            "            `$uu = & reg.exe unload `"HKU\`$tmp`" 2>&1"
-            "            if (`$LASTEXITCODE -ne 0) { `"PROFILE: `$img : LEFT MOUNTED (`$uu)`" }"
-            "        }"
-            "    }"
-            "}"
-        ) -join "`n"
+        $profileAudit = $env:audit_src
         Invoke-Guest 'intune-user-ps' $decoy | ForEach-Object { Write-Host "  $_" }
         # The two passes run back to back, with no probe between them. The probe
         # is not passive: it installs with VSTOInstaller and uninstalls to clean
@@ -1578,3 +1588,26 @@ lab-restore $vm=LAB_VM: cert-export
     )
     ($clear -join "`n") | & just --justfile $jf --working-directory $env:MO_REPO lab intune-user-ps $env:vm
     if ($LASTEXITCODE -ne 0) { throw "clearing the inclusion list on vm $env:vm failed (exit $LASTEXITCODE)" }
+
+# Which profiles on a lab guest hold the grant. The population is every profile
+# with a hive on disk, so a user who has never signed in since the rollout still
+# resolves to yes or no rather than being invisible.
+[doc('Per-profile grant audit on a lab VM: lab-inclusion-audit 304')]
+[group('verify')]
+[no-exit-message]
+[windows]
+[script]
+lab-inclusion-audit $vm=LAB_VM:
+    $ErrorActionPreference = 'Stop'
+    $out = $env:audit_src | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm
+    if ($LASTEXITCODE -ne 0) {
+        $out | ForEach-Object { Write-Host "  $_" }
+        throw "audit on vm $env:vm failed (exit $LASTEXITCODE)"
+    }
+    $rows = @($out | Where-Object { $_ -like 'PROFILE:*' })
+    if (-not $rows) { throw "no profiles reported on vm $env:vm; the audit did not run" }
+    $rows | ForEach-Object { $_ }
+    $missing = @($rows | Where-Object { $_ -like '*: none' -or $_ -like '*COULD NOT READ*' -or $_ -like '*LEFT MOUNTED*' })
+    ""
+    "profiles holding the grant : $($rows.Count - $missing.Count) of $($rows.Count)"
+    if ($missing) { exit 1 }
