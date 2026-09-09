@@ -33,6 +33,9 @@ set windows-shell := ["pwsh", "-NoLogo", "-Command"]
 default:
     @just --list
 
+# Intune publishing: ClickOnce publisher trust for the signed VSTO manifests.
+mod deploy
+
 # --- Versioning (MinVer, from git tags) -----------------------------------
 
 # Print the version MinVer derives from git tags (run `dotnet tool restore` first).
@@ -112,11 +115,19 @@ restore:
 restore:
     @echo 'restore is Windows-only (packages.config needs nuget.exe + MSBuild).'; exit 1
 
-# Build the add-in with MSBuild, signing the ClickOnce manifest with an ephemeral
-# self-signed cert. Trust comes from the per-machine Program Files MSI install,
-# not the cert identity (see docs/AUDIT-IAT-REDIRECT.md), so a self-signed cert
-# is correct here. Cert + build run in one shebang script so the thumbprint
-# persists between the two steps.
+# Build the add-in with MSBuild, signing the ClickOnce manifests with a
+# self-signed cert.
+#
+# A per-machine Program Files install grants the add-in NO trust. Office runs
+# every vstolocal add-in through the ClickOnce trust manager, which trusts a
+# manifest only if the signing certificate is in the machine's TrustedPublisher
+# store, or if a user accepted the trust prompt for that exact manifest URL and
+# public key. Silent MDM installs never see a prompt, so the certificate must be
+# deployed: `just deploy::trust-deploy`. The inclusion-list entry is keyed on
+# URL *and* key, so changing the install path or the cert revokes prior trust.
+#
+# Cert + build run in one shebang script so the thumbprint persists between the
+# two steps.
 [doc('Build + sign the VSTO add-in (MSBuild)')]
 [group('build')]
 [windows]
