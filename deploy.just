@@ -41,9 +41,8 @@ export CERT_OUT := "dist/OutlookFileDrag-publisher.cer"
 export REMEDIATION := "dist/Install-PublisherTrust.ps1"
 export SCRIPT_NAME := "OutlookFileDrag publisher trust"
 export GRAPH := "https://graph.microsoft.com/beta"
-# adadadad-… is Intune's built-in All Devices virtual group, acacacac-… All Users.
+# adadadad-… is Intune's built-in All Devices virtual group.
 export ALL_DEVICES := "adadadad-808e-44e2-905a-0b7873a8a531"
-export ALL_USERS := "acacacac-9df4-4c7d-9d50-4ef0226f57a9"
 
 # The per-user trust path. Measured on lab VM 304 with `lab-inclusion`: an entry
 # under HKCU\Software\Microsoft\VSTO\Security\Inclusion earns trust with the
@@ -60,7 +59,7 @@ export ALL_USERS := "acacacac-9df4-4c7d-9d50-4ef0226f57a9"
 # on 57 machines. The grant here is the narrowest the platform offers: one
 # manifest URL bound to one public key, and nothing else.
 export INCLUSION_REMEDIATION := "dist/Install-PublisherInclusion.ps1"
-export INCLUSION_NAME := "OutlookFileDrag publisher trust (per-user)"
+export INCLUSION_NAME := "OutlookFileDrag publisher trust (per-profile)"
 export RETIRE_REMEDIATION := "dist/Remove-PublisherTrust.ps1"
 export RETIRE_NAME := "OutlookFileDrag publisher trust (retire machine stores)"
 
@@ -407,14 +406,20 @@ trust-status $stale_days='7' $script_name=SCRIPT_NAME:
     if ($open) { exit 1 }
 
 
-# Render the device-side script that grants trust from HKCU alone.
+# Render the device-side script that grants trust from user hives alone.
 #
 # It carries the shipping certificate as one base64 literal, exactly like
 # trust-script, so `Get-DeployedThumbprint` reads this script's binding too.
 # Everything else is derived on the device: the manifest URL comes from the
 # machine add-in registration, so the entry names whatever path the MSI actually
 # installed to, and the public key is computed from the carried certificate.
-[doc('Generate the per-user inclusion-list script (no machine store)')]
+#
+# It runs as SYSTEM and writes into every profile hive on the machine, plus the
+# Default hive so profiles created later inherit the grant. A user-context script
+# would be a third of the code and would reach only whoever happens to be signed
+# in -- on a fleet where most devices have nobody signed in at any given moment,
+# that never converges, and the machine stores could never be retired.
+[doc('Generate the per-profile inclusion-list script (no machine store)')]
 [group('trust')]
 [windows]
 [script]
@@ -425,7 +430,7 @@ inclusion-script: cert-export
     $signer = New-Object Security.Cryptography.X509Certificates.X509Certificate2 $env:CERT_OUT
     "signer     : $($signer.Subject)"
     "thumbprint : $($signer.Thumbprint)"
-    "stores     : none -- the grant is one HKCU entry bound to this key and this URL"
+    "stores     : none -- one entry per profile hive, bound to this key and this URL"
     # No regex: the manifest value is a structured string with a known prefix and
     # a `|vstolocal` suffix, so Split and Substring read it exactly.
     $lines = @(
@@ -450,34 +455,111 @@ inclusion-script: cert-export
         "`$path = `$manifest.Split('|')[0]"
         "if (`$path.StartsWith('file:///')) { `$path = `$path.Substring(8) }"
         "`$url = 'file:///' + `$path.Replace('\', '/')"
-        "`$base = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion'"
-        # NOT New-Item -Force. On the registry provider, -Force on an EXISTING key
-        # recreates it and deletes every subkey under it -- which here is every
-        # trust grant this user holds, for every VSTO add-in on the machine.
-        # Measured: two back-to-back runs each minted a fresh GUID, because the
-        # second wiped the first before it could look for it.
-        "if (-not (Test-Path `$base)) { New-Item -Path `$base -Force | Out-Null }"
-        # An entry for this URL under a DIFFERENT key is trust for a build this
-        # machine no longer runs. Same reasoning as the store purge in
-        # trust-script: every build machine mints its own key under one subject.
-        "`$hit = `$null"
-        "foreach (`$k in @(Get-ChildItem `$base)) {"
-        "    `$p = Get-ItemProperty `$k.PSPath"
-        "    if (`$p.Url -ne `$url) { continue }"
-        "    if (`$p.PublicKey -eq `$key) { `$hit = `$k.PSChildName; continue }"
-        "    Remove-Item `$k.PSPath -Recurse -Force"
-        "    Write-Output `"removed stale inclusion entry `$(`$k.PSChildName)`""
+        "Write-Output `"manifest: `$url`""
+        # reg.exe writes its diagnostics to stderr, and under
+        # ErrorActionPreference = Stop a redirected native stderr line becomes a
+        # TERMINATING error -- the script died on `ERROR: Access is denied.`
+        # before it could read LASTEXITCODE and report which hive it was.
+        "function Invoke-Reg([string[]] `$Argv) {"
+        "    `$prev = `$ErrorActionPreference"
+        "    `$ErrorActionPreference = 'Continue'"
+        "    try {"
+        "        `$o = (& reg.exe @Argv 2>&1 | Out-String).Trim()"
+        "        return , @(`$LASTEXITCODE, `$o)"
+        "    } finally { `$ErrorActionPreference = `$prev }"
         "}"
-        "if (`$hit) {"
-        "    Write-Output `"already trusted: `$hit`""
-        "    exit 0"
+        # The .NET registry API, not the PowerShell provider. `reg unload` fails
+        # with Access denied while ANY handle into the hive is open, and the
+        # provider keeps its keys open past the statement that used them -- four
+        # of seven hives refused to unload, and a hive left mounted BLOCKS THAT
+        # USER'S SIGN-IN. Here every key is disposed on its own finally, so the
+        # handles are gone before the unload rather than whenever GC decides.
+        #
+        # CreateSubKey is also the correct primitive: it creates missing parents
+        # and LEAVES an existing key's children alone. `New-Item -Force` on an
+        # existing registry key recreates it and drops every subkey under it --
+        # here, every VSTO add-in's trust grant for that user.
+        "function Grant-Trust([string] `$Hive, [string] `$Who) {"
+        "    `$rel = `"`$Hive\Software\Microsoft\VSTO\Security\Inclusion`""
+        "    `$base = `$null"
+        "    try {"
+        "        `$base = [Microsoft.Win32.Registry]::Users.CreateSubKey(`$rel)"
+        "        `$hit = `$null"
+        "        foreach (`$name in @(`$base.GetSubKeyNames())) {"
+        "            `$sub = `$null"
+        "            `$stale = `$false"
+        "            try {"
+        "                `$sub = `$base.OpenSubKey(`$name, `$false)"
+        "                if (-not `$sub) { continue }"
+        "                if (`$sub.GetValue('Url') -ne `$url) { continue }"
+        "                if (`$sub.GetValue('PublicKey') -eq `$key) { `$hit = `$name; continue }"
+        "                `$stale = `$true"
+        "            } finally { if (`$sub) { `$sub.Dispose() } }"
+        "            if (`$stale) {"
+        "                `$base.DeleteSubKeyTree(`$name)"
+        "                Write-Output `"`$Who : removed stale entry `$name`""
+        "            }"
+        "        }"
+        "        if (`$hit) { Write-Output `"`$Who : already trusted (`$hit)`"; return }"
+        "        `$g = [Guid]::NewGuid().ToString()"
+        "        `$new = `$null"
+        "        try {"
+        "            `$new = `$base.CreateSubKey(`$g)"
+        "            `$new.SetValue('Url', `$url, [Microsoft.Win32.RegistryValueKind]::String)"
+        "            `$new.SetValue('PublicKey', `$key, [Microsoft.Win32.RegistryValueKind]::String)"
+        "        } finally { if (`$new) { `$new.Dispose() } }"
+        "        Write-Output `"`$Who : granted (`$g)`""
+        "    } finally { if (`$base) { `$base.Dispose() } }"
         "}"
-        "`$g = [Guid]::NewGuid().ToString()"
-        "`$new = Join-Path `$base `$g"
-        "New-Item -Path `$new -Force | Out-Null"
-        "New-ItemProperty -Path `$new -Name 'Url' -Value `$url -PropertyType String -Force | Out-Null"
-        "New-ItemProperty -Path `$new -Name 'PublicKey' -Value `$key -PropertyType String -Force | Out-Null"
-        "Write-Output `"granted trust for `$url as `$g`""
+        # Every profile with a hive on disk, plus the Default hive so a profile
+        # created after this runs inherits the grant instead of waiting a cycle.
+        "`$targets = @()"
+        "`$pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'"
+        # LocalSystem, LocalService and NetworkService have profiles and hives,
+        # and they never run Outlook. Writing a trust grant into them is pure
+        # collateral. Skip them by SID, not by profile path, which varies.
+        "`$service = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')"
+        "foreach (`$k in @(Get-ChildItem `$pl)) {"
+        "    if (`$service -contains `$k.PSChildName) { continue }"
+        "    `$img = (Get-ItemProperty `$k.PSPath).ProfileImagePath"
+        "    if (-not `$img) { continue }"
+        "    if (-not (Test-Path (Join-Path `$img 'NTUSER.DAT'))) { continue }"
+        "    `$targets += , @(`$k.PSChildName, `$img)"
+        "}"
+        "`$targets += , @('.DEFAULT-PROFILE', (Join-Path `$env:SystemDrive 'Users\Default'))"
+        "`$failed = 0"
+        "foreach (`$t in `$targets) {"
+        "    `$sid = `$t[0]"
+        "    `$dat = Join-Path `$t[1] 'NTUSER.DAT'"
+        "    if (-not (Test-Path `$dat)) { continue }"
+        "    if (Test-Path `"Registry::HKEY_USERS\`$sid`") {"
+        "        Grant-Trust `$sid `$sid"
+        "        continue"
+        "    }"
+        # An unloaded hive is a file. Mount it under a name of our own so nothing
+        # collides with a profile signing in while this runs, and unmount it.
+        "    `$tmp = 'OFD-' + `$sid"
+        "    `$r = Invoke-Reg @('load', `"HKU\`$tmp`", `$dat)"
+        "    if (`$r[0] -ne 0) {"
+        "        `$failed++"
+        "        Write-Output `"`$sid : COULD NOT LOAD HIVE (`$(`$r[1]))`""
+        "        continue"
+        "    }"
+        "    try {"
+        "        Grant-Trust `$tmp `$sid"
+        "    } catch {"
+        "        `$failed++"
+        "        Write-Output `"`$sid : FAILED `$(`$_.Exception.Message)`""
+        "    } finally {"
+        "        `$u = Invoke-Reg @('unload', `"HKU\`$tmp`")"
+        "        if (`$u[0] -ne 0) {"
+        "            `$failed++"
+        "            Write-Output `"`$sid : COULD NOT UNLOAD HIVE (`$(`$u[1]))`""
+        "        }"
+        "    }"
+        "}"
+        "if (`$failed) { throw `"`$failed profile(s) did not receive the grant`" }"
+        "Write-Output `"profiles processed: `$(`$targets.Count)`""
     )
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
     Set-Content -Path $out -Value $lines -Encoding UTF8
@@ -530,9 +612,9 @@ retire-script: cert-export
 # Publish the per-user grant. Same binding gate as trust-deploy: nothing targets
 # a population until the key inside the uploaded script equals the key inside the
 # shipping artifact.
-[doc('Publish the per-user inclusion grant to Intune (all users, user context)')]
+[doc('Publish the per-profile inclusion grant to Intune (all devices, SYSTEM)')]
 [group('trust')]
-[confirm("Deploy the per-user OutlookFileDrag trust grant to every managed user. Continue?")]
+[confirm("Deploy the per-profile OutlookFileDrag trust grant to every managed device. Continue?")]
 [windows]
 [script]
 inclusion-deploy: inclusion-script
@@ -552,9 +634,9 @@ inclusion-deploy: inclusion-script
     $payload = @{
         '@odata.type'         = '#microsoft.graph.deviceManagementScript'
         displayName           = $name
-        description           = 'Grants OutlookFileDrag ClickOnce trust from the per-user VSTO inclusion list. No certificate is written to any machine store.'
+        description           = 'Grants OutlookFileDrag ClickOnce trust in every profile hive via the VSTO inclusion list. No certificate is written to any machine store.'
         scriptContent         = $content
-        runAsAccount          = 'user'
+        runAsAccount          = 'system'
         enforceSignatureCheck = $false
         fileName              = 'Install-PublisherInclusion.ps1'
         runAs32Bit            = $false
@@ -586,7 +668,7 @@ inclusion-deploy: inclusion-script
     "binding OK, assigning"
     $assign = @{ deviceManagementScriptGroupAssignments = @(
             @{ '@odata.type' = '#microsoft.graph.deviceManagementScriptGroupAssignment'
-                targetGroupId = $env:ALL_USERS
+                targetGroupId = $env:ALL_DEVICES
             }
         )
     }
@@ -596,7 +678,7 @@ inclusion-deploy: inclusion-script
         --headers 'Content-Type=application/json' --body "@$tmp2" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "assign failed (az exit $LASTEXITCODE) for script $id" }
     Remove-Item $tmp2 -Force
-    "assigned to All Users"
+    "assigned to All Devices"
 
 # Take the self-signed certificate back out of the machine stores.
 #
@@ -736,34 +818,46 @@ verify-local:
 [script]
 lab-push $vm:
     $ErrorActionPreference = 'Stop'
-    $lines = @("`$d = 'C:\ProgramData\ofd-probe'", "New-Item -ItemType Directory -Force -Path `$d | Out-Null")
-    $expect = @{}
+    # ONE FILE PER CALL. Batching them shares one argv, so adding a file or
+    # growing one silently pushes the batch over the limit and the failure
+    # surfaces as "agent down" rather than "payload too big". Per-file, each
+    # payload is bounded by the largest single file.
+    $sent = 0
     # INCLUSION_REMEDIATION is the generated production script; it only exists
     # after `inclusion-script` has run, and lab-inclusion-prod needs the exact
     # bytes Intune will carry rather than a re-implementation of them.
     foreach ($p in $env:PROBE, $env:CONTROL, $env:INCLUSION_REMEDIATION) {
         if (-not (Test-Path $p)) { continue }
         $name = [IO.Path]::GetFileName($p)
-        $expect[$name] = (Get-FileHash $p -Algorithm SHA256).Hash
+        $hash = (Get-FileHash $p -Algorithm SHA256).Hash
         $raw = [IO.File]::ReadAllBytes($p)
         $ms = New-Object IO.MemoryStream
         $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Compress)
         $gz.Write($raw, 0, $raw.Length)
         $gz.Dispose()
-        $lines += "`$z = New-Object IO.MemoryStream(,[Convert]::FromBase64String('$([Convert]::ToBase64String($ms.ToArray()))'))"
-        $lines += "`$o = New-Object IO.MemoryStream"
-        $lines += "(New-Object IO.Compression.GZipStream(`$z, [IO.Compression.CompressionMode]::Decompress)).CopyTo(`$o)"
-        $lines += "[IO.File]::WriteAllBytes((Join-Path `$d '$name'), `$o.ToArray())"
-        $lines += "'$name ' + (Get-FileHash (Join-Path `$d '$name') -Algorithm SHA256).Hash"
+        $b64 = [Convert]::ToBase64String($ms.ToArray())
+        $lines = @(
+            "`$d = 'C:\ProgramData\ofd-probe'"
+            "New-Item -ItemType Directory -Force -Path `$d | Out-Null"
+            "`$z = New-Object IO.MemoryStream(,[Convert]::FromBase64String('$b64'))"
+            "`$o = New-Object IO.MemoryStream"
+            "(New-Object IO.Compression.GZipStream(`$z, [IO.Compression.CompressionMode]::Decompress)).CopyTo(`$o)"
+            "[IO.File]::WriteAllBytes((Join-Path `$d '$name'), `$o.ToArray())"
+            "'$name ' + (Get-FileHash (Join-Path `$d '$name') -Algorithm SHA256).Hash"
+        )
+        # The transport puts the whole payload on one `qm guest exec` command
+        # line as UTF-16LE base64, so the argv cost is roughly 8/3 of this.
+        $argv = [int]([Text.Encoding]::Unicode.GetByteCount($lines -join "`n") * 4 / 3)
+        if ($argv -gt 30000) {
+            throw "$name would need ~$argv bytes of argv, past the 32 KB Windows limit; the transport cannot carry it"
+        }
+        $out = ($lines -join "`n") | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm
+        if ($LASTEXITCODE -ne 0) { throw "could not reach vm $env:vm pushing $name (exit $LASTEXITCODE)" }
+        if (-not (($out -join "`n") -like "*$name $hash*")) { throw "guest copy of $name does not hash to $hash" }
+        "  $name  $hash  (~$argv bytes argv)"
+        $sent++
     }
-    $out = ($lines -join "`n") | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm
-    $out
-    if ($LASTEXITCODE -ne 0) { throw "could not reach vm $env:vm (exit $LASTEXITCODE)" }
-    $joined = $out -join "`n"
-    foreach ($e in $expect.GetEnumerator()) {
-        if (-not ($joined -like "*$($e.Key) $($e.Value)*")) { throw "guest copy of $($e.Key) does not hash to $($e.Value)" }
-    }
-    "pushed $($expect.Count) file(s) to C:\ProgramData\ofd-probe on vm $env:vm, hashes match"
+    "pushed $sent file(s) to C:\ProgramData\ofd-probe on vm $env:vm, hashes match"
 
 # Same probe, in a lab guest's INTERACTIVE session, so the live Outlook add-in
 # state is visible. Sign a user in and start Outlook first: an add-in that never
@@ -810,7 +904,13 @@ lab-control $vm=LAB_VM: (lab-push vm)
     $jf = "$env:MO_REPO/justfile"
     function Invoke-Guest([string] $Recipe, [string] $Ps) {
         $out = $Ps | & just --justfile $jf --working-directory $env:MO_REPO lab $Recipe $env:vm
-        if ($LASTEXITCODE -ne 0) { throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0) {
+            # Print what the guest said before throwing. Throwing on the captured
+            # output discards the only description of the failure and leaves the
+            # caller reading an exit code with no diagnosis.
+            $out | ForEach-Object { Write-Host "  $_" }
+            throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)"
+        }
         $out
     }
     # Write-Host, not the output stream: this function's return value is the exit
@@ -916,7 +1016,13 @@ lab-store-matrix $vm=LAB_VM: (lab-push vm)
     $jf = "$env:MO_REPO/justfile"
     function Invoke-Guest([string] $Recipe, [string] $Ps) {
         $out = $Ps | & just --justfile $jf --working-directory $env:MO_REPO lab $Recipe $env:vm
-        if ($LASTEXITCODE -ne 0) { throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0) {
+            # Print what the guest said before throwing. Throwing on the captured
+            # output discards the only description of the failure and leaves the
+            # caller reading an exit code with no diagnosis.
+            $out | ForEach-Object { Write-Host "  $_" }
+            throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)"
+        }
         $out
     }
     function Invoke-Arm([string] $Tag) {
@@ -1037,7 +1143,13 @@ lab-inclusion $vm=LAB_VM: (lab-push vm)
     $jf = "$env:MO_REPO/justfile"
     function Invoke-Guest([string] $Recipe, [string] $Ps) {
         $out = $Ps | & just --justfile $jf --working-directory $env:MO_REPO lab $Recipe $env:vm
-        if ($LASTEXITCODE -ne 0) { throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0) {
+            # Print what the guest said before throwing. Throwing on the captured
+            # output discards the only description of the failure and leaves the
+            # caller reading an exit code with no diagnosis.
+            $out | ForEach-Object { Write-Host "  $_" }
+            throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)"
+        }
         $out
     }
     function Invoke-Arm([string] $Tag) {
@@ -1198,7 +1310,13 @@ lab-inclusion-prod $vm=LAB_VM: inclusion-script (lab-push vm)
     $remote = 'C:\ProgramData\ofd-probe\' + [IO.Path]::GetFileName($env:INCLUSION_REMEDIATION)
     function Invoke-Guest([string] $Recipe, [string] $Ps) {
         $out = $Ps | & just --justfile $jf --working-directory $env:MO_REPO lab $Recipe $env:vm
-        if ($LASTEXITCODE -ne 0) { throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0) {
+            # Print what the guest said before throwing. Throwing on the captured
+            # output discards the only description of the failure and leaves the
+            # caller reading an exit code with no diagnosis.
+            $out | ForEach-Object { Write-Host "  $_" }
+            throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)"
+        }
         $out
     }
     function Invoke-Arm([string] $Tag) {
@@ -1270,6 +1388,50 @@ lab-inclusion-prod $vm=LAB_VM: inclusion-script (lab-push vm)
             "'planted decoy'"
         ) -join "`n"
         $decoyCheck = "`$k = 'HKCU:\Software\Microsoft\VSTO\Security\Inclusion\decoy-0000-0000-0000-000000000000'; 'DECOY: ' + (Test-Path `$k)"
+        $profileAudit = @(
+            "`$pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'"
+            "`$service = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')"
+            "foreach (`$k in @(Get-ChildItem `$pl)) {"
+            "    if (`$service -contains `$k.PSChildName) { continue }"
+            "    `$img = (Get-ItemProperty `$k.PSPath).ProfileImagePath"
+            "    if (-not `$img) { continue }"
+            "    `$dat = Join-Path `$img 'NTUSER.DAT'"
+            "    if (-not (Test-Path `$dat)) { continue }"
+            "    `$hive = `$k.PSChildName"
+            "    `$tmp = `$null"
+            "    if (-not (Test-Path `"Registry::HKEY_USERS\`$hive`")) {"
+            "        `$tmp = 'AUD-' + `$k.PSChildName"
+            "        & reg.exe load `"HKU\`$tmp`" `"`$dat`" 2>&1 | Out-Null"
+            "        if (`$LASTEXITCODE -ne 0) { `"PROFILE: `$img : busy`"; continue }"
+            "        `$hive = `$tmp"
+            "    }"
+            "    try {"
+            # .NET keys with explicit disposal, never the PowerShell provider:
+            # the provider holds its handles open and `reg unload` then fails
+            # with Access denied, leaving the hive mounted and that user unable
+            # to sign in.
+            "        `$urls = @()"
+            "        `$b = `$null"
+            "        try {"
+            "            `$b = [Microsoft.Win32.Registry]::Users.OpenSubKey(`"`$hive\Software\Microsoft\VSTO\Security\Inclusion`", `$false)"
+            "            if (`$b) {"
+            "                foreach (`$n in @(`$b.GetSubKeyNames())) {"
+            "                    `$s = `$null"
+            "                    try { `$s = `$b.OpenSubKey(`$n, `$false); if (`$s) { `$urls += `$s.GetValue('Url') } }"
+            "                    finally { if (`$s) { `$s.Dispose() } }"
+            "                }"
+            "            }"
+            "        } finally { if (`$b) { `$b.Dispose() } }"
+            "        `$ofd = @(`$urls | Where-Object { `$_ -like '*OutlookFileDrag.vsto' })"
+            "        if (`$ofd) { `"PROFILE: `$img : `$(`$ofd[0])`" } else { `"PROFILE: `$img : none`" }"
+            "    } finally {"
+            "        if (`$tmp) {"
+            "            `$uu = & reg.exe unload `"HKU\`$tmp`" 2>&1"
+            "            if (`$LASTEXITCODE -ne 0) { `"PROFILE: `$img : LEFT MOUNTED (`$uu)`" }"
+            "        }"
+            "    }"
+            "}"
+        ) -join "`n"
         Invoke-Guest 'intune-user-ps' $decoy | ForEach-Object { Write-Host "  $_" }
         # The two passes run back to back, with no probe between them. The probe
         # is not passive: it installs with VSTOInstaller and uninstalls to clean
@@ -1277,29 +1439,41 @@ lab-inclusion-prod $vm=LAB_VM: inclusion-script (lab-push vm)
         # between the passes made pass 2 re-grant from an empty hive and read as
         # non-idempotent when it was not.
         Write-Host ""
-        Write-Host "--- running the shipping script, pass 1 ---"
-        $p1 = Invoke-Guest 'intune-user-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$remote'"
+        # SYSTEM, exactly as Intune runs it -- not the interactive session. That
+        # is the whole point of the script: it reaches profiles nobody is signed
+        # in to, so the rollout converges on devices sitting at a lock screen.
+        Write-Host "--- running the shipping script as SYSTEM, pass 1 ---"
+        $p1 = Invoke-Guest 'intune-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$remote'"
         $p1 | ForEach-Object { Write-Host "  $_" }
         $n1 = Get-Count
         Write-Host ""
-        Write-Host "--- running the shipping script, pass 2 (idempotence) ---"
-        $p2 = Invoke-Guest 'intune-user-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$remote'"
+        Write-Host "--- running the shipping script as SYSTEM, pass 2 (idempotence) ---"
+        $p2 = Invoke-Guest 'intune-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$remote'"
         $p2 | ForEach-Object { Write-Host "  $_" }
         $n2 = Get-Count
-        $granted = ($p1 -join ' ') -like '*granted trust*'
-        $idem = ($p2 -join ' ') -like '*already trusted*'
+        $granted = ($p1 -join ' ') -like '*granted*'
+        $idem = -not (($p2 -join ' ') -like '*granted (*')
         $survived = @(Invoke-Guest 'intune-user-ps' $decoyCheck | Where-Object { $_ -like 'DECOY:*' })
         $decoyLives = $survived -and $survived[0].Split(':')[1].Trim() -eq 'True'
-        ""
-        "pass 1 granted trust        : $granted"
-        "pass 2 said already trusted : $idem"
-        "entries after pass 1 / 2    : $n1 / $n2 (the decoy is one of them)"
-        "unrelated grant survived    : $decoyLives"
+        # The lab users are the point of the exercise: nobody is signed in as them
+        # and their hives are files on disk. Read those files back and show the
+        # grant landed in the profile of a person who never touched the machine.
+        Write-Host ""
+        Write-Host "--- auditing every profile hive, including the signed-out lab users ---"
+        $audit = @(Invoke-Guest 'intune-ps' $profileAudit | Where-Object { $_ -like 'PROFILE:*' })
+        $audit | ForEach-Object { Write-Host "  $_" }
+        $granted_profiles = @($audit | Where-Object { $_ -notlike '*: none' })
         $results['after two passes'] = Invoke-Arm 'AFTER TWO PASSES OF THE SHIPPING SCRIPT'
-        # Measure what the probe leaves behind rather than inferring it. A
-        # user-context Intune script re-runs on its own cycle and repairs this,
-        # but the window is real and belongs in the docs.
+        # Measure what the probe leaves behind rather than inferring it. The
+        # script re-runs on its own IME cycle and repairs this, but the window is
+        # real and belongs in the docs.
         $n3 = Get-Count
+        ""
+        "pass 1 granted              : $granted"
+        "pass 2 changed nothing      : $idem"
+        "entries in the live hive    : $n1 then $n2 (the decoy is one of them)"
+        "unrelated grant survived    : $decoyLives"
+        "profiles holding the grant  : $($granted_profiles.Count) of $($audit.Count)"
         "entries after the probe     : $n3"
     } finally {
         Write-Host ""
@@ -1329,15 +1503,23 @@ lab-inclusion-prod $vm=LAB_VM: inclusion-script (lab-push vm)
         exit 1
     }
     if (-not $granted -or -not $idem -or $n1 -ne '2' -or $n2 -ne '2') {
-        "FAIL: not idempotent -- granted=$granted, already-trusted=$idem, entries $n1 then $n2"
+        "FAIL: not idempotent -- granted=$granted, second pass inert=$idem, entries $n1 then $n2"
         exit 1
     }
     if (-not $decoyLives) {
         "FAIL: the grant destroyed an unrelated add-in's trust entry"
         exit 1
     }
+    # A grant that only ever reaches the signed-in profile cannot retire the
+    # machine stores, because most devices have nobody signed in when the script
+    # runs. Every profile hive on the machine must hold it.
+    if (-not $audit -or $granted_profiles.Count -ne $audit.Count) {
+        "FAIL: $($audit.Count - $granted_profiles.Count) profile(s) did not receive the grant"
+        exit 1
+    }
     "PASS: the shipping script earns trust with no machine store, is idempotent,"
-    "      and leaves other add-ins' grants alone"
+    "      leaves other add-ins' grants alone, and reaches every profile on the"
+    "      machine including users who are not signed in"
     "note: VSTOInstaller /Uninstall removes the entry ($n3 left after the probe);"
     "      the user-context script re-grants on its next cycle"
 
@@ -1366,6 +1548,15 @@ lab-restore $vm=LAB_VM: cert-export
         "    `$s.Close()"
         "}"
         "Get-ChildItem 'C:\ProgramData\ofd-probe' -Filter '*.cer' -ErrorAction SilentlyContinue | Remove-Item -Force"
+        # A hive left mounted by an interrupted grant or audit BLOCKS THAT USER'S
+        # SIGN-IN, so it is the most damaging thing a failed run can leave behind.
+        # Both prefixes are ours; nothing else on the machine mounts under them.
+        "foreach (`$h in @(Get-ChildItem 'Registry::HKEY_USERS' | Where-Object { `$_.PSChildName -like 'OFD-*' -or `$_.PSChildName -like 'AUD-*' })) {"
+        "    `$n = `$h.PSChildName"
+        "    `$h.Dispose()"
+        "    `$o = & reg.exe unload `"HKU\`$n`" 2>&1"
+        "    `"unmounted `$n : `$(`$LASTEXITCODE -eq 0) `$o`""
+        "}"
     )
     ($lines -join "`n") | & just --justfile $jf --working-directory $env:MO_REPO lab intune-ps $env:vm
     if ($LASTEXITCODE -ne 0) { throw "restore on vm $env:vm failed (exit $LASTEXITCODE)" }
