@@ -890,7 +890,7 @@ lab-push $vm:
     # INCLUSION_REMEDIATION is the generated production script; it only exists
     # after `inclusion-script` has run, and lab-inclusion-prod needs the exact
     # bytes Intune will carry rather than a re-implementation of them.
-    foreach ($p in $env:PROBE, $env:CONTROL, $env:INCLUSION_REMEDIATION) {
+    foreach ($p in $env:PROBE, $env:CONTROL, $env:INCLUSION_REMEDIATION, $env:RETIRE_REMEDIATION) {
         if (-not (Test-Path $p)) { continue }
         $name = [IO.Path]::GetFileName($p)
         $hash = (Get-FileHash $p -Algorithm SHA256).Hash
@@ -1611,3 +1611,103 @@ lab-inclusion-audit $vm=LAB_VM:
     ""
     "profiles holding the grant : $($rows.Count - $missing.Count) of $($rows.Count)"
     if ($missing) { exit 1 }
+
+# Prove the RETIREMENT is safe: with the grant in place, taking the certificate
+# out of both machine stores must leave Office still trusting the add-in.
+#
+# retire-deploy's gate decides WHEN it is safe to run fleet-wide. This decides
+# whether the script it publishes does the right thing at all. Without this, the
+# first evidence either way would be 57 machines losing the add-in.
+[doc('Prove retirement keeps trust on a lab VM: lab-retire-check 304')]
+[group('verify')]
+[confirm("Run the machine-store REMOVAL on that machine and restore after. Lab machines only. Continue?")]
+[no-exit-message]
+[windows]
+[script]
+lab-retire-check $vm=LAB_VM: inclusion-script retire-script (lab-push vm)
+    $ErrorActionPreference = 'Stop'
+    $jf = "$env:MO_REPO/justfile"
+    $grant = 'C:\ProgramData\ofd-probe\' + [IO.Path]::GetFileName($env:INCLUSION_REMEDIATION)
+    $remove = 'C:\ProgramData\ofd-probe\' + [IO.Path]::GetFileName($env:RETIRE_REMEDIATION)
+    function Invoke-Guest([string] $Recipe, [string] $Ps) {
+        $out = $Ps | & just --justfile $jf --working-directory $env:MO_REPO lab $Recipe $env:vm
+        if ($LASTEXITCODE -ne 0) {
+            $out | ForEach-Object { Write-Host "  $_" }
+            throw "$Recipe on vm $env:vm failed (exit $LASTEXITCODE)"
+        }
+        $out
+    }
+    function Invoke-Arm([string] $Tag) {
+        Write-Host ""
+        Write-Host "########## $Tag ##########"
+        $out = Invoke-Guest 'intune-user-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Check-AddInTrust.ps1' -SinceHours 1"
+        $out | ForEach-Object { Write-Host "  $_" }
+        $line = @($out | Where-Object { $_ -like 'INSTALLER:*' })
+        if (-not $line) { return 'none' }
+        $line[-1].Split(':')[1].Trim()
+    }
+    $thumb = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $env:CERT_OUT).Thumbprint
+    $stores = "foreach (`$n in 'TrustedPublisher', 'Root') { `$s = New-Object Security.Cryptography.X509Certificates.X509Store `$n, 'LocalMachine'; `$s.Open('ReadOnly'); `"STORE: `$n `" + (`$s.Certificates.Find('FindByThumbprint', '$thumb', `$false).Count -gt 0); `$s.Close() }"
+    function Get-Stores {
+        @(Invoke-Guest 'intune-ps' $stores | Where-Object { $_ -like 'STORE:*' }) -join ' | '
+    }
+    "signer under test : $thumb"
+    "before            : $(Get-Stores)"
+    # The grant must be in place first. Retiring the stores without it is the
+    # exact outage retire-deploy's coverage gate exists to prevent.
+    Write-Host ""
+    Write-Host "--- granting into every profile hive (SYSTEM) ---"
+    Invoke-Guest 'intune-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$grant'" | ForEach-Object { Write-Host "  $_" }
+    $before = Invoke-Arm 'STORES PRESENT, GRANT PRESENT'
+    try {
+        # The probe is not passive. It asks VSTOInstaller by installing, then
+        # uninstalls to clean up after itself, and that uninstall DELETES the
+        # inclusion entry for the profile it ran as -- measured in
+        # lab-inclusion-prod as `entries after the probe : 1` where there were 2.
+        # Without this re-grant the next arm tests a machine with no stores AND no
+        # grant, reads -300, and blames the retirement for an outage the
+        # measurement caused.
+        Write-Host ""
+        Write-Host "--- re-granting what the probe consumed (SYSTEM) ---"
+        Invoke-Guest 'intune-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$grant'" | ForEach-Object { Write-Host "  $_" }
+        Write-Host ""
+        Write-Host "--- running the shipping removal script (SYSTEM) ---"
+        Invoke-Guest 'intune-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$remove'" | ForEach-Object { Write-Host "  $_" }
+        $after = Get-Stores
+        "stores after      : $after"
+        $retired = Invoke-Arm 'STORES RETIRED, GRANT CARRYING TRUST'
+    } finally {
+        Write-Host ""
+        Write-Host "--- putting the certificate back (SYSTEM) ---"
+        $cer = [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:CERT_OUT))
+        $put = @(
+            "`$c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String('$cer'))"
+            "foreach (`$n in 'TrustedPublisher', 'Root') {"
+            "    `$s = New-Object Security.Cryptography.X509Certificates.X509Store `$n, 'LocalMachine'"
+            "    `$s.Open('ReadWrite')"
+            "    if (-not `$s.Certificates.Find('FindByThumbprint', `$c.Thumbprint, `$false).Count) { `$s.Add(`$c) }"
+            "    `$s.Close()"
+            "}"
+        ) -join "`n"
+        Invoke-Guest 'intune-ps' $put | ForEach-Object { Write-Host $_ }
+        "stores restored   : $(Get-Stores)"
+    }
+    ""
+    "########## RESULT ##########"
+    "  stores + grant                 VSTOInstaller exit $before"
+    "  grant alone, stores retired    VSTOInstaller exit $retired"
+    "  stores after removal           $after"
+    ""
+    if ($before -eq 'none' -or $retired -eq 'none' -or $before -eq '-400' -or $retired -eq '-400') {
+        "INVALID: an arm produced no trust decision"
+        exit 2
+    }
+    if ($after -notlike '*TrustedPublisher False*' -or $after -notlike '*Root False*') {
+        "FAIL: the removal script did not empty both machine stores"
+        exit 1
+    }
+    if ($before -ne '0' -or $retired -ne '0') {
+        "FAIL: retiring the machine stores withdrew trust"
+        exit 1
+    }
+    "PASS: the certificate is out of both machine stores and Office still trusts the add-in"
