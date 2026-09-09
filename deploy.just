@@ -791,10 +791,21 @@ retire-deploy: retire-script
     if ($LASTEXITCODE -ne 0) { throw "assign failed (az exit $LASTEXITCODE) for script $id" }
     Remove-Item $tmp2 -Force
     "assigned to All Devices"
+    # Unassign the script this replaces IN THE SAME RUN. Leaving it targeted
+    # means the two fight: removal runs, then the machine-store script re-adds
+    # the certificate on the next cycle, and the fleet never actually retires
+    # anything. Telling a human to do it afterwards is not a rollout.
     if ($old) {
-        ""
-        "the machine-store script $($old.id) is still assigned; unassign it in Intune so it"
-        "does not put the certificate back on the next cycle"
+        $none = @{ deviceManagementScriptGroupAssignments = @() }
+        $tmp3 = New-TemporaryFile
+        ($none | ConvertTo-Json -Depth 5) | Set-Content -Path $tmp3 -Encoding UTF8
+        az rest --method post --url "$graph/deviceManagement/deviceManagementScripts/$($old.id)/assign" `
+            --headers 'Content-Type=application/json' --body "@$tmp3" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "could not unassign the machine-store script $($old.id); it will re-add the certificate" }
+        Remove-Item $tmp3 -Force
+        $check = az rest --method get --url "$graph/deviceManagement/deviceManagementScripts/$($old.id)/assignments" --output json | ConvertFrom-Json
+        "machine-store script $($old.id) now has $(@($check.value).Count) assignment(s)"
+        if (@($check.value).Count -ne 0) { throw "the machine-store script is still assigned; it will put the certificate back" }
     }
 # Report whether Office will load the add-in here, and why. Exit 0 trusted, 1 not.
 [doc('Diagnose add-in trust on the current machine')]

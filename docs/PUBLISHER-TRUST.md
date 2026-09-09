@@ -56,31 +56,55 @@ Two Intune platform scripts, both gated on the certificate inside the shipping
 artifact matching the certificate inside the uploaded script.
 
 ```
-Install-PublisherTrust.ps1        system context, All Devices
+Install-PublisherTrust.ps1        SYSTEM, All Devices
     writes the signer to LocalMachine\TrustedPublisher and \Root
 
-Install-PublisherInclusion.ps1    user context,   All Users
-    writes one HKCU inclusion entry; touches no machine store
+Install-PublisherInclusion.ps1    SYSTEM, All Devices
+    writes one inclusion entry into every profile hive on the machine, plus
+    C:\Users\Default\NTUSER.DAT so profiles created later inherit it;
+    touches no machine store
 ```
 
 The second replaces the first. `just deploy::retire-deploy` publishes
 `Remove-PublisherTrust.ps1`, which takes the certificate back out of both machine
 stores — and refuses to run until every device carrying the certificate has a
-successful per-user grant, so the fleet is never between the two models.
+successful grant, so the fleet is never between the two models.
 
-### Two things the per-user script had to be shown not to do
+**Why SYSTEM and not user context.** The grant lives in a user hive, so a
+user-context script assigned to All Users is the obvious mapping. It was shipped
+that way first and it could not converge: user-context scripts run only in a
+signed-in session, so on a fleet where most devices have nobody signed in the
+ledger stays at `run states : 0` and the retire gate never opens. SYSTEM reaches
+every hive — loaded ones under `HKEY_USERS\<sid>`, the rest mounted from
+`NTUSER.DAT` — on the same cycle as the script it replaces. Service SIDs
+(`S-1-5-18/19/20`) are skipped; they have hives and never run Outlook.
+
+### Four things the grant had to be shown not to do
 
 `New-Item -Force` on an **existing** registry key recreates it and drops its
 subkeys. The inclusion list is shared by every VSTO add-in for that user, so the
 reflex `New-Item -Path $base -Force` would have revoked every other add-in's
-trust on every cycle. `lab-inclusion-prod` plants a decoy grant for an unrelated
-URL and fails if it does not survive.
+trust on every cycle. The script uses `RegistryKey.CreateSubKey`, which creates
+missing parents and leaves existing children alone, and `lab-inclusion-prod`
+plants a decoy grant for an unrelated URL and fails if it does not survive.
+
+The PowerShell registry **provider** holds key handles open, and `reg unload`
+then fails with `Access is denied` — four of seven hives on the first run, with
+`[gc]::Collect()` making no difference. A fresh SYSTEM process unloaded them
+instantly, which is what identified handles rather than permissions. Every key
+is a `[Microsoft.Win32.Registry]` handle disposed in its own `finally`. **A hive
+left mounted blocks that user's sign-in**, so `lab-restore` unmounts any
+`HKU\OFD-*` or `HKU\AUD-*` an interrupted run left behind.
+
+`reg.exe` writes diagnostics to stderr, and under `ErrorActionPreference = Stop`
+a redirected native stderr line is a *terminating* error — the script died on the
+first `ERROR: Access is denied.` before it could read `$LASTEXITCODE` and name
+the hive. Native calls go through `Invoke-Reg`, which returns the code and text.
 
 `VSTOInstaller /Uninstall` deletes the inclusion entry. The probe runs one to
 clean up after itself, so the two idempotence passes run back to back with no
 probe between them. In production the same is true of anything that uninstalls
-the customization in a user session; the user-context script re-grants on its
-next cycle.
+the customization in a user session; the script re-grants on its next cycle.
 
 ## Signing: what exists and what it does not solve
 
@@ -127,14 +151,14 @@ CA-issued leaf renders `'TrustedPublisher'`.
 ```
 just deploy::trust-audit               the deployed script carries the shipping artifact's key
 just deploy::trust-status              every Windows device resolves to one state
-just deploy::trust-status 7 "OutlookFileDrag publisher trust (per-user)"
-                                       the same ledger for the per-user grant
+just deploy::trust-status 7 "OutlookFileDrag publisher trust (per-profile)"
+                                       the same ledger for the per-profile grant
 just deploy::verify-local              will Office load it on this machine, and why
 just deploy::lab-verify 304            the same, in a lab guest's interactive session
 just deploy::lab-control 304           the answer tracks the certificate and nothing else
 just deploy::lab-store-matrix 304      which store earns the trust
 just deploy::lab-inclusion 304         can HKCU alone earn it, with no machine store
-just deploy::lab-inclusion-prod 304    the SHIPPING per-user script, end to end
+just deploy::lab-inclusion-prod 304    the SHIPPING grant script, end to end
 just deploy::lab-restore 304           put a lab guest back after an interrupted run
 ```
 
