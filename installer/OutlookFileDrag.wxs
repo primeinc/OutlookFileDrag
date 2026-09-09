@@ -66,7 +66,14 @@
         Condition="Installed OR WIX_IS_NETFRAMEWORK_472_OR_LATER_INSTALLED"
         Message="This application requires .NET Framework 4.7.2 or later. Please install it and run setup again." />
 
-    <!-- [ProgramFiles*]\Tony Federer\Outlook File Drag -->
+    <!-- [ProgramFiles*]\4pp\Outlook File Drag.
+         Office keys each user's ClickOnce trust decision on the manifest URL and
+         the signing key together, so moving this directory (or re-signing with a
+         different certificate) revokes trust on every machine that already had it
+         and the add-in stops loading with the MSI still reporting success. Renaming
+         1.0.11's "Tony Federer" folder to "4pp" is what broke the 1.0.13 rollout.
+         Deploy publisher trust with `just deploy::trust-deploy` before shipping a
+         build that changes either. -->
     <StandardDirectory Id="$(PlatformProgramFiles)">
       <Directory Id="MfrFolder" Name="4pp">
         <Directory Id="INSTALLFOLDER" Name="Outlook File Drag" />
