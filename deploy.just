@@ -580,7 +580,12 @@ inclusion-script: cert-export
         "    `$targets += , @(`$k.PSChildName, `$img)"
         "}"
         "`$targets += , @('.DEFAULT-PROFILE', (Join-Path `$env:SystemDrive 'Users\Default'))"
-        "`$failed = 0"
+        # A list, not a counter. Intune reports the ERROR stream for a failed
+        # script and drops the output stream, so `Write-Output` diagnostics are
+        # discarded exactly when they are needed: a real device reported
+        # "1 profile(s) did not receive the grant" and nothing about which or
+        # why. The reason has to travel inside the terminating error itself.
+        "`$problems = @()"
         "foreach (`$t in `$targets) {"
         "    `$sid = `$t[0]"
         "    `$dat = Join-Path `$t[1] 'NTUSER.DAT'"
@@ -594,24 +599,26 @@ inclusion-script: cert-export
         "    `$tmp = 'OFD-' + `$sid"
         "    `$r = Invoke-Reg @('load', `"HKU\`$tmp`", `$dat)"
         "    if (`$r[0] -ne 0) {"
-        "        `$failed++"
+        "        `$problems += `"`$sid (`$(`$t[1])): could not mount NTUSER.DAT -- `$(`$r[1])`""
         "        Write-Output `"`$sid : COULD NOT LOAD HIVE (`$(`$r[1]))`""
         "        continue"
         "    }"
         "    try {"
         "        Grant-Trust `$tmp `$sid"
         "    } catch {"
-        "        `$failed++"
+        "        `$problems += `"`$sid (`$(`$t[1])): `$(`$_.Exception.Message)`""
         "        Write-Output `"`$sid : FAILED `$(`$_.Exception.Message)`""
         "    } finally {"
         "        `$u = Invoke-Reg @('unload', `"HKU\`$tmp`")"
         "        if (`$u[0] -ne 0) {"
-        "            `$failed++"
+        "            `$problems += `"`$sid (`$(`$t[1])): LEFT MOUNTED, blocks that user's sign-in -- `$(`$u[1])`""
         "            Write-Output `"`$sid : COULD NOT UNLOAD HIVE (`$(`$u[1]))`""
         "        }"
         "    }"
         "}"
-        "if (`$failed) { throw `"`$failed profile(s) did not receive the grant`" }"
+        "if (`$problems) {"
+        "    throw (`"`$(`$problems.Count) of `$(`$targets.Count) profile(s) did not receive the grant: `" + (`$problems -join ' | '))"
+        "}"
         "Write-Output `"profiles processed: `$(`$targets.Count)`""
     )
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
