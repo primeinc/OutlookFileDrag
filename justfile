@@ -148,12 +148,45 @@ build: restore
         "[assembly: AssemblyFileVersion(""${core}.0"")]",
         "[assembly: AssemblyInformationalVersion(""$full"")]")
     Write-Host "version: $full (assembly ${core}.0)"
-    # Reuse an existing self-signed cert; don't mint one per build (store bloat).
+    # The manifest signing key. ClickOnce trust is keyed on the manifest URL AND
+    # the public key, so the key that signs a release decides whether every grant
+    # already on the fleet still covers it. A key minted on the build machine
+    # makes each machine -- and each CI runner -- a different publisher: v1.0.13
+    # was signed by a GitHub Actions runner and that private key no longer exists,
+    # so nothing can ever re-sign as that publisher again.
+    #
+    # SIGNING_PFX / SIGNING_PFX_PASSWORD, or SIGNING_THUMBPRINT for a key already
+    # in CurrentUser\My, pin it. With neither, the build still works and still
+    # signs -- it just signs as this machine, which is fine for development and
+    # is NOT a release. Say so rather than leaving it to be discovered by a fleet
+    # that stops loading the add-in.
     $subject = 'CN=OutlookFileDrag (Build)'
-    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date) } | Sort-Object NotAfter -Descending | Select-Object -First 1
-    if (-not $cert) {
-        $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject `
-            -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
+    $durable = $true
+    if ($env:SIGNING_PFX) {
+        if (-not (Test-Path $env:SIGNING_PFX)) { throw "SIGNING_PFX is set but there is no file at $($env:SIGNING_PFX)" }
+        $pw = if ($env:SIGNING_PFX_PASSWORD) { ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force } else { $null }
+        $cert = Import-PfxCertificate -FilePath $env:SIGNING_PFX -CertStoreLocation Cert:\CurrentUser\My -Password $pw
+        if (-not $cert) { throw "could not import $($env:SIGNING_PFX)" }
+    } elseif ($env:SIGNING_THUMBPRINT) {
+        $want = $env:SIGNING_THUMBPRINT.Replace(' ', '').ToUpperInvariant()
+        $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $want } | Select-Object -First 1
+        if (-not $cert) { throw "SIGNING_THUMBPRINT $want is not in CurrentUser\My on this machine" }
+        if (-not $cert.HasPrivateKey) { throw "SIGNING_THUMBPRINT $want has no private key here, so it cannot sign" }
+    } else {
+        $durable = $false
+        $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date) } | Sort-Object NotAfter -Descending | Select-Object -First 1
+        if (-not $cert) {
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject `
+                -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
+        }
+    }
+    Write-Host "signing key: $($cert.Thumbprint)  $($cert.Subject)"
+    if (-not $durable) {
+        Write-Host "  MACHINE-LOCAL KEY -- development build."
+        Write-Host "  A release signed with this key is a new publisher: every inclusion-list"
+        Write-Host "  grant on the fleet is keyed to the previous key and will not cover it,"
+        Write-Host "  and no other machine can reproduce this signature."
+        Write-Host "  Set SIGNING_PFX (+ SIGNING_PFX_PASSWORD) or SIGNING_THUMBPRINT to release."
     }
     msbuild OutlookFileDrag\OutlookFileDrag.csproj /t:Build `
         /p:Configuration={{ CONFIGURATION }} /p:Platform=AnyCPU `

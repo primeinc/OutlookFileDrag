@@ -140,6 +140,27 @@ The shipping MSI is `NotSigned`. Trusted Signing can sign it with the account
 that already exists, which is worth doing on its own account — it just has no
 bearing on whether Office loads the add-in.
 
+### The manifest signing key must be pinned to release
+
+ClickOnce trust is keyed on the manifest URL **and** the public key, so the key
+that signs a release decides whether the grants already on the fleet cover it.
+
+`just build` signs with `SIGNING_PFX` (+ `SIGNING_PFX_PASSWORD`) or
+`SIGNING_THUMBPRINT` when either is set. With neither it mints or reuses
+`CN=OutlookFileDrag (Build)` in `CurrentUser\My` — a different publisher on every
+build machine — and prints `MACHINE-LOCAL KEY -- development build` naming the
+consequence. v1.0.13 was signed that way by a GitHub Actions runner, so its
+private key is gone and nothing can re-sign as that publisher.
+
+A release signed with a key other than `20ED4E09B4D4775A571B70514442C8752EE672E4`
+revokes every inclusion-list grant on the fleet until the grant script, which
+carries the certificate, is redeployed and every device runs it again.
+`trust-audit` is the check: it compares the certificate inside the uploaded
+script with the one inside the shipping MSI.
+
+Where the durable key lives is still open. It needs to outlive any one build
+machine — Key Vault in `4PP Production Core` is the obvious home.
+
 `trust-script` decides the machine-store branch from the certificate: a signer
 whose Subject equals its Issuer is self-signed and gets TrustedPublisher + Root,
 anything CA-issued gets TrustedPublisher only. Both branches are controlled — the
