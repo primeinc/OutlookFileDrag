@@ -1718,3 +1718,116 @@ lab-retire-check $vm=LAB_VM: inclusion-script retire-script (lab-push vm)
         exit 1
     }
     "PASS: the certificate is out of both machine stores and Office still trusts the add-in"
+
+# Exercise the FAILURE path of the grant, which no passing run ever touches.
+#
+# A real fleet device reported "1 profile(s) did not receive the grant" and
+# nothing else. The diagnostic was fixed blind: nothing had ever run the branch
+# that produces it. This injects a profile whose hive cannot be mounted -- a
+# ProfileList entry pointing at a file that is not a registry hive -- and asserts
+# the script names the profile and the cause, still grants every healthy profile,
+# and leaves no hive mounted behind it.
+#
+# A hive left mounted blocks that user's sign-in, so the cleanup assertion is the
+# point as much as the message is.
+[doc('Prove the grant reports WHICH profile failed and why (lab VM)')]
+[group('verify')]
+[confirm("Temporarily add a broken profile entry to that machine's ProfileList, then remove it. Lab machines only. Continue?")]
+[no-exit-message]
+[windows]
+[script]
+lab-inclusion-fault $vm=LAB_VM: inclusion-script (lab-push vm)
+    $ErrorActionPreference = 'Stop'
+    $jf = "$env:MO_REPO/justfile"
+    $grant = 'C:\ProgramData\ofd-probe\' + [IO.Path]::GetFileName($env:INCLUSION_REMEDIATION)
+    # 2>&1 ON THE TRANSPORT. A failing guest script's terminating error comes back
+    # on the transport's STDERR as CLIXML, so a plain capture holds only the
+    # guest's stdout -- which is the half that does NOT carry the enriched
+    # message. Merge, or this control reads a stream that cannot contain what it
+    # is asserting.
+    function Invoke-Guest([string] $Recipe, [string] $Ps, [switch] $AllowFail) {
+        $out = $Ps | & just --justfile $jf --working-directory $env:MO_REPO lab $Recipe $env:vm 2>&1
+        $code = $LASTEXITCODE
+        if ($code -ne 0 -and -not $AllowFail) {
+            $out | ForEach-Object { Write-Host "  $_" }
+            throw "$Recipe on vm $env:vm failed (exit $code)"
+        }
+        , @($code, $out)
+    }
+    # PowerShell wraps error text at the console width, so a phrase this asserts
+    # on ("could not mount") arrives split across a line, and CLIXML escapes the
+    # break as _x000D__x000A_. Collapsing every whitespace run to one space puts
+    # the phrase back. Unstructured console output, no grammar, no parser -- so
+    # this is string surgery on purpose, and only in a test assertion.
+    function Get-Flat([object[]] $Lines) {
+        $s = ($Lines | ForEach-Object { "$_" }) -join ' '
+        $s = $s.Replace('_x000D_', ' ').Replace('_x000A_', ' ')
+        [string]::Join(' ', $s.Split([char[]]" `t`r`n", [StringSplitOptions]::RemoveEmptyEntries))
+    }
+    $sid = 'S-1-5-21-0-0-0-9999'
+    $dir = 'C:\Users\ofd-fault'
+    $inject = @(
+        "New-Item -ItemType Directory -Force -Path '$dir' | Out-Null"
+        # Not a registry hive. `reg load` refuses it deterministically -- no
+        # timing, no lock to hold, no sleep.
+        "Set-Content -Path '$dir\NTUSER.DAT' -Value 'this is not a registry hive' -Encoding ASCII"
+        "`$p = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid'"
+        "New-Item -Path `$p -Force | Out-Null"
+        "New-ItemProperty -Path `$p -Name 'ProfileImagePath' -Value '$dir' -PropertyType ExpandString -Force | Out-Null"
+        "'injected $sid -> $dir'"
+    ) -join "`n"
+    $cleanup = @(
+        "`$p = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid'"
+        "if (Test-Path `$p) { Remove-Item `$p -Recurse -Force }"
+        "Remove-Item '$dir' -Recurse -Force -ErrorAction SilentlyContinue"
+        "'ProfileList entry gone : ' + (-not (Test-Path `$p))"
+        "'profile directory gone : ' + (-not (Test-Path '$dir'))"
+        "foreach (`$h in @(Get-ChildItem 'Registry::HKEY_USERS' | Where-Object { `$_.PSChildName -like 'OFD-*' })) { 'STRANDED: ' + `$h.PSChildName }"
+    ) -join "`n"
+    Write-Host "--- injecting an unmountable profile ---"
+    (Invoke-Guest 'intune-ps' $inject)[1] | ForEach-Object { Write-Host "  $_" }
+    try {
+        Write-Host ""
+        Write-Host "--- running the shipping grant, expecting it to FAIL loudly ---"
+        # 2>&1 IN THE GUEST. The enriched message lives in the terminating error,
+        # and that is the stream Intune reports for a failed script -- asserting
+        # on stdout alone measures a stream nobody reads on failure, and the first
+        # run of this control failed for that reason rather than a real one.
+        $r = Invoke-Guest 'intune-ps' "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$grant' 2>&1" -AllowFail
+        $code = $r[0]
+        $text = Get-Flat $r[1]
+        $r[1] | ForEach-Object { Write-Host "  $_" }
+    } finally {
+        Write-Host ""
+        Write-Host "--- removing the injected profile ---"
+        $c = (Invoke-Guest 'intune-ps' $cleanup)[1]
+        $c | ForEach-Object { Write-Host "  $_" }
+        $stranded = @($c | Where-Object { $_ -like 'STRANDED:*' })
+    }
+    ""
+    "########## RESULT ##########"
+    "  exit code                 : $code"
+    "  names the profile         : $($text -like "*$sid*")"
+    "  names the profile path    : $($text -like "*$dir*")"
+    "  says it could not mount   : $($text -like '*could not mount*')"
+    "  granted healthy profiles  : $($text -like '*granted*' -or $text -like '*already trusted*')"
+    "  hives left mounted        : $($stranded.Count)"
+    ""
+    if ($code -eq 0) {
+        "FAIL: an unmountable profile did not fail the device, so the ledger would call it covered"
+        exit 1
+    }
+    if ($text -notlike "*$sid*" -or $text -notlike "*$dir*" -or $text -notlike '*could not mount*') {
+        "FAIL: the failure does not say which profile or why"
+        exit 1
+    }
+    if ($text -notlike '*granted*' -and $text -notlike '*already trusted*') {
+        "FAIL: one broken profile stopped the healthy ones from being granted"
+        exit 1
+    }
+    if ($stranded.Count -ne 0) {
+        "FAIL: $($stranded.Count) hive(s) left mounted; that blocks those users' sign-in"
+        exit 1
+    }
+    "PASS: the failure names the profile and the cause, healthy profiles still get the grant,"
+    "      and no hive is left mounted"
