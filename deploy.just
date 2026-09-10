@@ -876,6 +876,16 @@ retire-status: graph-login
     # as a ~740,000-day age rather than failing. lastStateUpdateDateTime on the
     # state itself is real, and it answers the better question anyway: how long
     # this device has been sitting in a state that is not success.
+    # "How long in this state" does not distinguish a machine that is stuck from
+    # one that is switched off, and those need opposite responses. lastSyncDateTime
+    # decides it -- but it has to come from managedDevices, because the device
+    # `$expand` returns is a stub whose dates are all 0001-01-01.
+    $sync = @{}
+    foreach ($d in Invoke-GraphAll "$graph/deviceManagement/managedDevices?`$filter=operatingSystem eq 'Windows'&`$select=id,lastSyncDateTime") {
+        if ($d.lastSyncDateTime) {
+            $sync[$d.id] = [datetime]::Parse($d.lastSyncDateTime, [cultureinfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)
+        }
+    }
     $failed = @{}
     $seen = @{}
     $since = @{}
@@ -903,16 +913,30 @@ retire-status: graph-login
             # in silence: a device with NO run state has not been handed the policy
             # yet, while one that HAS a state and still is not success has been
             # handed it and has not run it. Updating a script's content resets every
-            # device to that second shape, so it is normal right after a redeploy
-            # and a stall if it persists. Print how long it has been in that state
-            # rather than inventing a threshold: hours after a redeploy is the
-            # rollout working, days is a device to go look at.
+            # device to that second shape, so it is normal right after a redeploy.
+            #
+            # Whether it is a STALL is decided by the last sync, not by elapsed
+            # time: a device that has checked in SINCE entering the state and still
+            # has not run the script is the one to go look at, and a device that
+            # has not checked in at all is simply off. Say which, rather than
+            # inventing a staleness threshold and calling switched-off machines
+            # failures.
+            $utc = (Get-Date).ToUniversalTime()
             ""
             "$($waiting.Count) awaiting their IME cycle:"
             @($waiting | ForEach-Object {
                     $tag = if ($seen[$_]) { 'reported, not run' } else { 'not yet reported' }
-                    $age = if ($since[$_]) { '{0:N1}h' -f ((Get-Date).ToUniversalTime() - $since[$_]).TotalHours } else { '-' }
-                    '  {0,-17}  {1,-24} in this state {2}' -f $tag, $need[$_], $age
+                    $age = if ($since[$_]) { '{0:N1}h' -f ($utc - $since[$_]).TotalHours } else { '-' }
+                    $seen_at = if ($sync[$_]) { '{0:N1}h' -f ($utc - $sync[$_]).TotalHours } else { 'never' }
+                    # Only a device that HAS a state can be judged against it. A
+                    # device that was never handed the policy is not "offline"
+                    # merely because it has not run something it never received.
+                    $note =
+                    if (-not $sync[$_]) { 'never checked in' }
+                    elseif (-not $since[$_]) { '' }
+                    elseif ($sync[$_] -gt $since[$_]) { 'CHECKED IN SINCE -- go look' }
+                    else { 'offline' }
+                    '  {0,-17}  {1,-24} in this state {2,-7} last sync {3,-7} {4}' -f $tag, $need[$_], $age, $seen_at, $note
                 }) | Sort-Object
         }
         if ($blocked) {
