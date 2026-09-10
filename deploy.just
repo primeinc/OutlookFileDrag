@@ -672,6 +672,10 @@ retire-script: cert-export
 # Publish the per-user grant. Same binding gate as trust-deploy: nothing targets
 # a population until the key inside the uploaded script equals the key inside the
 # shipping artifact.
+# Updating scriptContent RESETS every device's run state to pending: devices that
+# had already succeeded re-run on their next cycle and drop out of the coverage
+# gate until they do. Redeploying mid-rollout costs a full convergence cycle, so
+# do it for a defect, not for a tidy-up.
 [doc('Publish the per-profile inclusion grant to Intune (all devices, SYSTEM)')]
 [group('trust')]
 [confirm("Deploy the per-profile OutlookFileDrag trust grant to every managed device. Continue?")]
@@ -787,23 +791,30 @@ retire-deploy: retire-script
         "Nothing has confirmed it ran, so removing the machine stores would withdraw trust."
         exit 1
     }
-    $ok = @($grantStates | Where-Object { $_.runState -eq 'success' -and $_.managedDevice.id })
     $covered = @{}
-    foreach ($s in $ok) { $covered[$s.managedDevice.id] = $true }
+    foreach ($s in $grantStates) {
+        if ($s.runState -eq 'success' -and $s.managedDevice.id) { $covered[$s.managedDevice.id] = $true }
+    }
     "per-user grant : $($grant.id), $($covered.Count) device(s) succeeded"
     # The devices that must be covered are the ones the machine script reached.
     # Those are exactly the machines carrying a certificate this would remove.
-    $need = @()
+    # DEVICES, not run states. Graph returns more than one state row per device
+    # -- a device that ran a script twice has two -- so counting rows overstated
+    # the population on both sides and would have listed the same machine twice
+    # in the gap. Both sides are keyed on device id.
+    $need = @{}
     if ($old) {
         $oldStates = @(Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts/$($old.id)/deviceRunStates?`$expand=managedDevice")
-        $need = @($oldStates | Where-Object { $_.runState -eq 'success' -and $_.managedDevice.id })
+        foreach ($s in $oldStates) {
+            if ($s.runState -eq 'success' -and $s.managedDevice.id) { $need[$s.managedDevice.id] = $s.managedDevice.deviceName }
+        }
         "machine script : $($old.id), $($need.Count) device(s) carry the certificate"
     }
-    $gap = @($need | Where-Object { -not $covered[$_.managedDevice.id] })
+    $gap = @($need.Keys | Where-Object { -not $covered[$_] })
     if ($gap) {
         ""
         "REFUSING: $($gap.Count) device(s) hold the machine-store trust with no per-user grant:"
-        $gap | ForEach-Object { "  $($_.managedDevice.deviceName)" }
+        $gap | ForEach-Object { "  $($need[$_])" } | Sort-Object
         ""
         "Removing the stores now would leave Office refusing to load the add-in there."
         exit 1
