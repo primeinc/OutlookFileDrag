@@ -743,20 +743,21 @@ inclusion-deploy: inclusion-script
     if ($LASTEXITCODE -ne 0) { throw "assign failed (az exit $LASTEXITCODE) for script $id" }
     Remove-Item $tmp2 -Force
     "assigned to All Devices"
-
-# Take the self-signed certificate back out of the machine stores.
+# Is the fleet ready to have the machine stores retired?
 #
-# ORDER IS LOAD-BEARING. Removing the machine stores while a user has no
-# inclusion entry withdraws trust from that user: measured, exit -300. This
-# refuses to run until the per-user grant has succeeded everywhere the machine
-# script did, so the fleet is never between two models.
-[doc('Retire the machine-store trust once the per-user grant has landed')]
+# ORDER IS LOAD-BEARING. Removing the machine stores from a device whose users
+# have no grant withdraws trust there: measured, exit -300. This answers only
+# that question, changes nothing, and exits 1 while any device carrying the
+# certificate lacks the grant.
+#
+# retire-deploy depends on it, so the gate cannot drift from the thing it gates
+# and can be watched on its own while a rollout converges.
+[doc('Is every device carrying the certificate covered by the grant?')]
 [group('trust')]
-[confirm("Remove the OutlookFileDrag publisher certificate from TrustedPublisher AND Root on every managed device. The per-user grant must already cover them. Continue?")]
 [no-exit-message]
 [windows]
 [script]
-retire-deploy: retire-script
+retire-status:
     $ErrorActionPreference = 'Stop'
     $graph = $env:GRAPH
     function Invoke-Graph([string]$url) {
@@ -820,6 +821,36 @@ retire-deploy: retire-script
         exit 1
     }
     "coverage OK: every device carrying the certificate has the per-user grant"
+# Take the self-signed certificate back out of the machine stores.
+#
+# The coverage gate is `retire-status`, a dependency: just runs it first and
+# aborts this recipe if it exits non-zero, so the check that authorises the
+# removal is the same code anyone can run to ask whether it is safe yet.
+[doc('Retire the machine-store trust once the grant has landed')]
+[group('trust')]
+[confirm("Remove the OutlookFileDrag publisher certificate from TrustedPublisher AND Root on every managed device. The grant must already cover them. Continue?")]
+[no-exit-message]
+[windows]
+[script]
+retire-deploy: retire-script retire-status
+    $ErrorActionPreference = 'Stop'
+    $graph = $env:GRAPH
+    function Invoke-Graph([string]$url) {
+        $out = az rest --method get --url $url --output json
+        if ($LASTEXITCODE -ne 0) { throw "graph GET failed (az exit $LASTEXITCODE): $url" }
+        $out | ConvertFrom-Json
+    }
+    function Invoke-GraphAll([string]$url) {
+        $all = @()
+        while ($url) {
+            $page = Invoke-Graph $url
+            $all += $page.value
+            $url = $page.'@odata.nextLink'
+        }
+        $all
+    }
+    $scripts = Invoke-GraphAll "$graph/deviceManagement/deviceManagementScripts"
+    $old = $scripts | Where-Object { $_.displayName -eq $env:SCRIPT_NAME } | Select-Object -First 1
     $name = $env:RETIRE_NAME
     $content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:RETIRE_REMEDIATION))
     $existing = $scripts | Where-Object { $_.displayName -eq $name } | Select-Object -First 1
