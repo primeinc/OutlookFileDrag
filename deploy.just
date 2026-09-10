@@ -871,10 +871,25 @@ retire-status: graph-login
     # its own. A device still working through its IME cycle needs patience; a
     # device whose grant FAILED needs a person, and will hold this gate shut
     # forever if nobody is told which one it is.
+    # The timestamp comes off the RUN STATE, not off managedDevice. `$expand`
+    # returns a stub device whose date fields are all 0001-01-01, which formats
+    # as a ~740,000-day age rather than failing. lastStateUpdateDateTime on the
+    # state itself is real, and it answers the better question anyway: how long
+    # this device has been sitting in a state that is not success.
     $failed = @{}
+    $seen = @{}
+    $since = @{}
     foreach ($s in $grantStates) {
-        if ($s.runState -in @('fail', 'scriptError') -and $s.managedDevice.id) {
-            $failed[$s.managedDevice.id] = $s.errorDescription
+        if (-not $s.managedDevice.id) { continue }
+        if ($s.runState -in @('fail', 'scriptError')) { $failed[$s.managedDevice.id] = $s.errorDescription }
+        $seen[$s.managedDevice.id] = $true
+        $t = $s.lastStateUpdateDateTime
+        if ($t) {
+            # Parse to UTC and compare against UTC. A bare [datetime] cast keeps
+            # the Z instant's wall clock with no offset applied, so subtracting a
+            # local Get-Date produced negative ages.
+            $u = [datetime]::Parse($t, [cultureinfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)
+            if ($u.Year -gt 2000) { $since[$s.managedDevice.id] = $u }
         }
     }
     $gap = @($need.Keys | Where-Object { -not $covered[$_] })
@@ -884,9 +899,21 @@ retire-status: graph-login
         ""
         "REFUSING: $($gap.Count) device(s) hold the machine-store trust with no grant."
         if ($waiting) {
+            # Two shapes hide in "waiting", and the second is how a rollout stalls
+            # in silence: a device with NO run state has not been handed the policy
+            # yet, while one that HAS a state and still is not success has been
+            # handed it and has not run it. Updating a script's content resets every
+            # device to that second shape, so it is normal right after a redeploy
+            # and a stall if it persists. Print how long it has been in that state
+            # rather than inventing a threshold: hours after a redeploy is the
+            # rollout working, days is a device to go look at.
             ""
-            "$($waiting.Count) awaiting their IME cycle -- these resolve on their own:"
-            @($waiting | ForEach-Object { "  $($need[$_])" }) | Sort-Object
+            "$($waiting.Count) awaiting their IME cycle:"
+            @($waiting | ForEach-Object {
+                    $tag = if ($seen[$_]) { 'reported, not run' } else { 'not yet reported' }
+                    $age = if ($since[$_]) { '{0:N1}h' -f ((Get-Date).ToUniversalTime() - $since[$_]).TotalHours } else { '-' }
+                    '  {0,-17}  {1,-24} in this state {2}' -f $tag, $need[$_], $age
+                }) | Sort-Object
         }
         if ($blocked) {
             ""
