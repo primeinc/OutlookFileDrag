@@ -72,6 +72,32 @@ export CONTROL := "tools/Test-TrustControl.ps1"
 export MO_REPO := env('MO_REPO', replace(justfile_directory(), '\', '/') + '/../mo')
 export LAB_VM := env('LAB_VM', '304')
 
+# Graph auth is the wbp-az-skills service principal, certificate, own az profile.
+#
+# These recipes used to inherit whatever `az` happened to be signed in as. That
+# worked only because one background command exported
+# AZURE_CONFIG_DIR=.../az-skills/intune-lab/state/.azapp, a profile already
+# holding this principal. Nothing in this repo said so, so the same recipe run
+# from an ordinary shell used the interactive user profile and got
+#   Forbidden ... must have one of the following scopes: DeviceManagementScripts...
+# The Azure CLI's own app is pre-authorized on Microsoft Graph for a fixed scope
+# set carrying no DeviceManagement scope, so a user session can never be the
+# credential here -- only an app with the roles can.
+#
+# Exporting AZURE_CONFIG_DIR from the module makes that explicit and identical
+# from any shell, and keeps deployment auth out of the interactive session in
+# both directions.
+#
+# The principal already holds every role these recipes need, application-type
+# and admin-consented: DeviceManagementScripts.ReadWrite.All,
+# DeviceManagementConfiguration.ReadWrite.All,
+# DeviceManagementManagedDevices.ReadWrite.All. Verify with
+#   az rest --method get --url "$GRAPH/servicePrincipals(appId='<id>')/appRoleAssignments"
+export AZURE_CONFIG_DIR := env('OFD_AZURE_CONFIG_DIR', replace(home_directory(), '\', '/') + '/.azure-outlookfiledrag')
+export GRAPH_TENANT := env('GRAPH_TENANT', 'cffbf047-c1e9-4778-a916-93e4e5274641')
+export GRAPH_APP_ID := env('GRAPH_APP_ID', 'ff0c2765-abf1-4df5-aded-655fccffac3a')
+export GRAPH_CERT := env('GRAPH_CERT', replace(home_directory(), '\', '/') + '/.wbp/wbp-az-skills.pem')
+
 # Read back what Intune will actually run, and report the certificate IN IT.
 # The first rollout of this script shipped the workstation's key — same Subject as
 # the released one, different private key, signed nothing the fleet runs. Subject
@@ -151,6 +177,36 @@ foreach ($k in @(Get-ChildItem $pl)) {
 [private]
 default:
     @just --list deploy
+
+# Sign in to Graph as the deployment principal. Idempotent: it re-uses the
+# profile's existing token and only authenticates when the profile is empty or
+# holds someone else.
+#
+# `az login` is the ONE place a `2>&1` capture would hide the thing worth
+# reading, so failures print whole. A missing certificate is the common one --
+# say which path was tried rather than letting az's own message imply the app is
+# wrong.
+[doc('Sign in to Graph as the deployment service principal')]
+[group('trust')]
+[script]
+graph-login:
+    $ErrorActionPreference = 'Stop'
+    $who = (az account show --query 'user.name' --output tsv 2>$null)
+    if ($who -eq $env:GRAPH_APP_ID) {
+        "graph auth : $($env:GRAPH_APP_ID) (cached)"
+        exit 0
+    }
+    if (-not (Test-Path $env:GRAPH_CERT)) {
+        throw "no certificate at $($env:GRAPH_CERT); set GRAPH_CERT to the deployment principal's PEM (cert + private key)"
+    }
+    az login --service-principal `
+        --username $env:GRAPH_APP_ID `
+        --tenant $env:GRAPH_TENANT `
+        --certificate $env:GRAPH_CERT `
+        --allow-no-subscriptions `
+        --output none
+    if ($LASTEXITCODE -ne 0) { throw "az login failed as $($env:GRAPH_APP_ID) with $($env:GRAPH_CERT)" }
+    "graph auth : $($env:GRAPH_APP_ID) via $($env:GRAPH_CERT)"
 
 # Pull the public half of the manifest signing certificate out of the shipping MSI.
 # Override the artifact with `MSI_SOURCE=<path-or-url> just deploy::cert-export`:
@@ -266,7 +322,7 @@ trust-script: cert-export
 [confirm("Deploy the OutlookFileDrag signing certificate to TrustedPublisher AND Root on every managed device. Continue?")]
 [windows]
 [script]
-trust-deploy: trust-script
+trust-deploy: graph-login trust-script
     $ErrorActionPreference = 'Stop'
     $graph = $env:GRAPH
     $name = $env:SCRIPT_NAME
@@ -340,7 +396,7 @@ trust-deploy: trust-script
 [no-exit-message]
 [windows]
 [script]
-trust-audit: cert-export
+trust-audit: graph-login cert-export
     $ErrorActionPreference = 'Stop'
     $graph = $env:GRAPH
     Invoke-Expression $env:binding_src
@@ -369,7 +425,7 @@ trust-audit: cert-export
 [no-exit-message]
 [windows]
 [script]
-trust-status $stale_days='7' $script_name=SCRIPT_NAME:
+trust-status $stale_days='7' $script_name=SCRIPT_NAME: graph-login
     $ErrorActionPreference = 'Stop'
     $graph = $env:GRAPH
     $staleDays = [int]$env:stale_days
@@ -681,7 +737,7 @@ retire-script: cert-export
 [confirm("Deploy the per-profile OutlookFileDrag trust grant to every managed device. Continue?")]
 [windows]
 [script]
-inclusion-deploy: inclusion-script
+inclusion-deploy: graph-login inclusion-script
     $ErrorActionPreference = 'Stop'
     $graph = $env:GRAPH
     $name = $env:INCLUSION_NAME
@@ -757,7 +813,7 @@ inclusion-deploy: inclusion-script
 [no-exit-message]
 [windows]
 [script]
-retire-status:
+retire-status: graph-login
     $ErrorActionPreference = 'Stop'
     $graph = $env:GRAPH
     function Invoke-Graph([string]$url) {
@@ -811,11 +867,35 @@ retire-status:
         }
         "machine script : $($old.id), $($need.Count) device(s) carry the certificate"
     }
+    # "Not covered" is two different situations and only one of them resolves on
+    # its own. A device still working through its IME cycle needs patience; a
+    # device whose grant FAILED needs a person, and will hold this gate shut
+    # forever if nobody is told which one it is.
+    $failed = @{}
+    foreach ($s in $grantStates) {
+        if ($s.runState -in @('fail', 'scriptError') -and $s.managedDevice.id) {
+            $failed[$s.managedDevice.id] = $s.errorDescription
+        }
+    }
     $gap = @($need.Keys | Where-Object { -not $covered[$_] })
     if ($gap) {
+        $blocked = @($gap | Where-Object { $failed.ContainsKey($_) })
+        $waiting = @($gap | Where-Object { -not $failed.ContainsKey($_) })
         ""
-        "REFUSING: $($gap.Count) device(s) hold the machine-store trust with no per-user grant:"
-        $gap | ForEach-Object { "  $($need[$_])" } | Sort-Object
+        "REFUSING: $($gap.Count) device(s) hold the machine-store trust with no grant."
+        if ($waiting) {
+            ""
+            "$($waiting.Count) awaiting their IME cycle -- these resolve on their own:"
+            @($waiting | ForEach-Object { "  $($need[$_])" }) | Sort-Object
+        }
+        if ($blocked) {
+            ""
+            "$($blocked.Count) FAILED and will not resolve without attention:"
+            @($blocked | ForEach-Object { "  $($need[$_])  $($failed[$_])" }) | Sort-Object
+            ""
+            "Read the whole reason with:"
+            "  just deploy::trust-status 7 `"$($env:INCLUSION_NAME)`""
+        }
         ""
         "Removing the stores now would leave Office refusing to load the add-in there."
         exit 1
@@ -832,7 +912,7 @@ retire-status:
 [no-exit-message]
 [windows]
 [script]
-retire-deploy: retire-script retire-status
+retire-deploy: graph-login retire-script retire-status
     $ErrorActionPreference = 'Stop'
     $graph = $env:GRAPH
     function Invoke-Graph([string]$url) {

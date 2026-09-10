@@ -146,6 +146,28 @@ anything CA-issued gets TrustedPublisher only. Both branches are controlled — 
 shipping certificate renders `'TrustedPublisher','Root'`, a locally minted
 CA-issued leaf renders `'TrustedPublisher'`.
 
+## Graph auth
+
+Every recipe that talks to Intune depends on `graph-login`, which signs in as the
+`wbp-az-skills` service principal with a certificate, into an az profile the
+module owns (`AZURE_CONFIG_DIR`, default `~/.azure-outlookfiledrag`). It is
+idempotent and re-authenticates from the certificate, so no recipe rides a cached
+token or the interactive session.
+
+```
+GRAPH_APP_ID   ff0c2765-abf1-4df5-aded-655fccffac3a
+GRAPH_CERT     ~/.wbp/wbp-az-skills.pem      cert + private key, PEM
+GRAPH_TENANT   cffbf047-c1e9-4778-a916-93e4e5274641
+```
+
+The principal holds `DeviceManagementScripts.ReadWrite.All`,
+`DeviceManagementConfiguration.ReadWrite.All` and
+`DeviceManagementManagedDevices.ReadWrite.All` as admin-consented application
+permissions. A signed-in user cannot substitute: the Azure CLI's own app is
+pre-authorized on Microsoft Graph for a fixed scope set containing no
+DeviceManagement scope, and Intune answers
+`Forbidden … must have one of the following scopes`.
+
 ## Verifying
 
 ```
