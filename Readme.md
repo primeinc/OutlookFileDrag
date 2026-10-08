@@ -91,7 +91,20 @@ whose version equals the incoming one: release `1.2.3` is `1.2.3.0`, and the bui
 commits after it is `1.2.3.N`.
 
 - Print the current version: `just version`.
-- Cut a release: `just tag 1.2.3`, `just release-signed`, `just publish`.
+- Cut a release: `just tag 1.2.3`, `just release-signed`, the lab user flow, `just publish`.
+
+**Lab user flow** (`deploy.just`; needs the `mo` lab and the Intune package in `az-skills`)
+
+`just publish` refuses a build that has not passed it.
+
+| Recipe | What it does |
+| --- | --- |
+| `just deploy lab-desktop <vm>` | Signs a local test user in at the lab VM's console (restarts it). `lab-desktop-state <vm>` says when it is there. |
+| `just deploy lab-install <vm> <msi>` | Installs the MSI as SYSTEM with the Intune package's install script, then runs its detection script. |
+| `just deploy lab-flow <vm> on <file version>` | Starts classic Outlook, drags an e-mail with the mouse onto `tools/drop-inspector.html` in Edge, and checks what the page read against the add-in's log and the file it wrote. `off` in place of `on` is the control: the add-in's hook switched off. Record and screen picture land in `dist/lab-flow/`. |
+| `just deploy lab-desktop-end <vm>`, then `lab-desktop-remove <vm>` | Stops signing the test user in (restarts the VM); deletes the user and its profile. |
+
+Office is not activated for the test user: Outlook runs for five days from that user's first start, then only views and prints.
 
 **CI / releases** (`.github/workflows/`)
 
