@@ -106,66 +106,68 @@ clean up after itself, so the two idempotence passes run back to back with no
 probe between them. In production the same is true of anything that uninstalls
 the customization in a user session; the script re-grants on its next cycle.
 
-## Signing: what exists and what it does not solve
+## Signing
 
-The tenant has Azure Trusted Signing, identity validated:
+From 1.0.14 a release is signed by Azure Artifact Signing:
 
 ```
-cs-wc-prod    3e4d24be…/rg-wc-prod    Basic  eastus
-cs-x1xp-dev   e4eb7658…/rg-x1xp-dev   Basic  eastus
-cp-wc-prod    Active, identityValidationId a8b984e7-08bf-4f49-8f3c-e73c845107e6
-              CN=titlesolutionsllc.com, O=titlesolutionsllc.com, OU=IT
-              profileType: PrivateTrust, certificates rotate ~3 days
+account   cs-wc-prod (rg-wc-prod, eastus), endpoint https://eus.codesigning.azure.net/
+profile   cp-public-trust, PublicTrust, identity validation c6275452-001e-4759-b696-b91f231cd27f
+subject   CN=Title Solutions Agency LLC, O=Title Solutions Agency LLC, L=Plymouth, S=Michigan, C=US
+chain     Microsoft ID Verified CS EOC CA 03 -> Microsoft ID Verified Code Signing PCA 2021
+          -> Microsoft Identity Verification Root Certificate Authority 2020
+signer    the Azure CLI login holding "Artifact Signing Certificate Profile Signer" on the profile
 ```
 
-Neither account removes the need to deploy something to every machine:
+`just release-signed` signs `OutlookFileDrag.dll`, both ClickOnce manifests and both
+MSIs with it, then expands each MSI and checks the payload: valid signatures of that
+subject, one certificate across assembly and manifests, a timestamp on each, every
+manifest hash equal to the file that ships, and the file version this commit builds.
 
-- The profile is **PrivateTrust**, whose root is not in the Windows root program.
-  A `PublicTrust` profile chains publicly and the existing identity validation
-  covers creating one.
-- Even a publicly-chaining certificate still needs the TrustedPublisher
-  deployment. That is exactly what the `without TrustedPublisher` arm measures.
-- Trusted Signing signs what SignTool signs. ClickOnce manifests (`.vsto`,
-  `.manifest`) are XML-DSIG signed by `mage.exe` /
-  `System.Deployment.Internal.CodeSigning`, which is not a SignTool format, and
-  the supported integrations are SignTool, GitHub Actions, Azure DevOps tasks,
-  PowerShell for Authenticode, Az CI policy, the SDK and a .NET crypto provider —
-  no mage. The service never releases the certificate, so mage cannot borrow it.
-  - learn.microsoft.com/azure/artifact-signing/faq — "You can sign all file types
-    that SignTool supports"; "The Authenticode certificate that's used for signing
-    with the profile is never given to you."
-  - learn.microsoft.com/azure/artifact-signing/how-to-signing-integrations
+The manifests are signed by `dotnet/sign` (`sign code artifact-signing`, pinned in
+`.config/dotnet-tools.json`). It runs `mage -update` and writes the XML-DSIG
+signature with the service's key, so nothing needs the certificate in a local
+store. Its file list has to name the deployment manifest by extension
+(`**/*.vsto`): the tool works on a copy under a temporary name and signs only what
+the list matches. A list of `**/OutlookFileDrag.*` signs the application manifest
+and leaves the deployment manifest carrying the build-machine signature.
 
-The shipping MSI is `NotSigned`. Trusted Signing can sign it with the account
-that already exists, which is worth doing on its own account — it just has no
-bearing on whether Office loads the add-in.
+The service keeps the private key and issues a new certificate every day, valid 72
+hours. So each release is signed by a different certificate under one subject, and
+trust that names a certificate or a public key belongs to one release.
 
-### The manifest signing key must be pinned to release
+### What the trust manager does with that signature
 
-ClickOnce trust is keyed on the manifest URL **and** the public key, so the key
-that signs a release decides whether the grants already on the fleet cover it.
+Measured on lab VM 303, VSTOInstaller as the oracle, run as a standard user through
+a batch-logon scheduled task, signer `0E0733B4477BA6B27C5AE349C698D22496356C49`
+(notAfter 2026-10-10 17:24Z). The second column is the same machine with its clock
+set to 2026-10-13 and time sync off:
 
-`just build` signs with `SIGNING_PFX` (+ `SIGNING_PFX_PASSWORD`) or
-`SIGNING_THUMBPRINT` when either is set. With neither it mints or reuses
-`CN=OutlookFileDrag (Build)` in `CurrentUser\My` — a different publisher on every
-build machine — and prints `MACHINE-LOCAL KEY -- development build` naming the
-consequence. v1.0.13 was signed that way by a GitHub Actions runner, so its
-private key is gone and nothing can re-sign as that publisher.
+| arm | certificate valid | three days past expiry |
+| --- | --- | --- |
+| nothing deployed | `-300` | `-300` |
+| leaf in `LocalMachine\TrustedPublisher` only | `0` | `0` |
+| per-profile inclusion entry only | `0` | `0` |
 
-A release signed with a key other than `20ED4E09B4D4775A571B70514442C8752EE672E4`
-revokes every inclusion-list grant on the fleet until the grant script, which
-carries the certificate, is redeployed and every device runs it again.
-`trust-audit` is the check: it compares the certificate inside the uploaded
-script with the one inside the shipping MSI.
+A signer that chains publicly still needs one of the two grants. It needs no Root
+deployment. The timestamp carries either grant past the certificate's expiry.
 
-Where the durable key lives is still open. It needs to outlive any one build
-machine — Key Vault in `4PP Production Core` is the obvious home.
+### How a release's trust reaches the fleet
 
-`trust-script` decides the machine-store branch from the certificate: a signer
-whose Subject equals its Issuer is self-signed and gets TrustedPublisher + Root,
-anything CA-issued gets TrustedPublisher only. Both branches are controlled — the
-shipping certificate renders `'TrustedPublisher','Root'`, a locally minted
-CA-issued leaf renders `'TrustedPublisher'`.
+The Intune app (az-skills `fleet-grade/win32/outlook-file-drag`) installs the MSI
+as SYSTEM and then adds the certificate that signed the installed deployment
+manifest to `LocalMachine\TrustedPublisher`. It first requires a valid Authenticode
+signature of Title Solutions Agency LLC on the MSI and the same subject and issuer
+on the manifest signer. Trust arrives with the files, on the same run, and covers
+every profile on the machine.
+
+`Install-PublisherTrust.ps1` and `Install-PublisherInclusion.ps1` above carry the
+1.0.13 signer `20ED4E09B4D4775A571B70514442C8752EE672E4`, a key minted on a GitHub
+Actions runner that no longer exists. A device needs them only while it still runs
+1.0.13. Both generators take any MSI (`MSI_SOURCE`); `trust-script` writes
+TrustedPublisher alone for a CA-issued signer and removes only self-signed
+certificates of the same subject, so it never takes away the certificate of a
+release a device still runs.
 
 ## Graph auth
 

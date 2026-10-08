@@ -17,7 +17,7 @@
 CONFIGURATION := "Release"
 # MinVer (minver-cli, pinned in .config/dotnet-tools.json) derives the version from
 # git tags: tag `v1.0.13` -> 1.0.13; commits after a tag -> 1.0.14-alpha.0.N. `-t v`
-# matches release.yml's tag prefix; `-m 1.0` floors the version before the first tag.
+# is the tag prefix; `-m 1.0` floors the version before the first tag.
 MINVER := "dotnet minver -t v -m 1.0"
 # OSMF EULA id required by WiX v7 = "wix" + major version. Accepting is free for
 # non-revenue use; passed to every `wix` command so builds are non-interactive.
@@ -39,7 +39,8 @@ export PROJECT_URL := "https://github.com/primeinc/OutlookFileDrag"
 
 # just defaults to `sh` even on Windows; use PowerShell (cross-platform pwsh /
 # PowerShell 7) for recipe lines there. (casey/just examples/powershell.just.)
-set windows-shell := ["pwsh", "-NoLogo", "-Command"]
+[windows]
+set shell := ["pwsh", "-NoLogo", "-Command"]
 
 # List available recipes (runs when `just` is invoked with no arguments).
 default:
@@ -55,8 +56,9 @@ mod deploy
 version:
     @{{ MINVER }}
 
-# Create + push an annotated release tag (e.g. `just tag 1.0.14`); triggers release.yml.
-[confirm("Tag and push v{{ ver }} -- this triggers a release build. Continue?")]
+# Create + push an annotated release tag (e.g. `just tag 1.0.14`). The tag is what makes MinVer
+# call the commit 1.0.14; `just release-signed` then builds it and `just publish` releases it.
+[confirm("Tag and push v{{ ver }}. Continue?")]
 [group('version')]
 tag ver:
     git tag -a v{{ ver }} -m "v{{ ver }}"
@@ -127,16 +129,18 @@ restore:
 restore:
     @echo 'restore is Windows-only (packages.config needs nuget.exe + MSBuild).'; exit 1
 
-# Build the add-in with MSBuild, signing the ClickOnce manifests with a
-# self-signed cert.
+# Build the add-in with MSBuild. The VSTO targets must sign the ClickOnce manifests
+# with something, so this signs them with a certificate minted on the build machine.
+# That is a development build: no other machine can reproduce the signature and no
+# PC trusts it. `just release-signed` replaces every signature with the Artifact
+# Signing certificate, and that is what ships. v1.0.13 shipped the build-machine
+# signature of a GitHub Actions runner; that key no longer exists.
 #
 # A per-machine Program Files install grants the add-in NO trust. Office runs
 # every vstolocal add-in through the ClickOnce trust manager, which trusts a
 # manifest only if the signing certificate is in the machine's TrustedPublisher
-# store, or if a user accepted the trust prompt for that exact manifest URL and
-# public key. Silent MDM installs never see a prompt, so the certificate must be
-# deployed: `just deploy::trust-deploy`. The inclusion-list entry is keyed on
-# URL *and* key, so changing the install path or the cert revokes prior trust.
+# store and its chain validates, or if the user's inclusion list holds that exact
+# manifest URL and public key. See docs/PUBLISHER-TRUST.md.
 #
 # Cert + build run in one shebang script so the thumbprint persists between the
 # two steps.
@@ -175,45 +179,14 @@ build: restore
         "[assembly: AssemblyFileVersion(""$fileVersion"")]",
         "[assembly: AssemblyInformationalVersion(""$full"")]")
     Write-Host "version: $full (assembly ${core}.0, file $fileVersion)"
-    # The manifest signing key. ClickOnce trust is keyed on the manifest URL AND
-    # the public key, so the key that signs a release decides whether every grant
-    # already on the fleet still covers it. A key minted on the build machine
-    # makes each machine -- and each CI runner -- a different publisher: v1.0.13
-    # was signed by a GitHub Actions runner and that private key no longer exists,
-    # so nothing can ever re-sign as that publisher again.
-    #
-    # SIGNING_PFX / SIGNING_PFX_PASSWORD, or SIGNING_THUMBPRINT for a key already
-    # in CurrentUser\My, pin it. With neither, the build still works and still
-    # signs -- it just signs as this machine, which is fine for development and
-    # is NOT a release. Say so rather than leaving it to be discovered by a fleet
-    # that stops loading the add-in.
     $subject = 'CN=OutlookFileDrag (Build)'
-    $durable = $true
-    if ($env:SIGNING_PFX) {
-        if (-not (Test-Path $env:SIGNING_PFX)) { throw "SIGNING_PFX is set but there is no file at $($env:SIGNING_PFX)" }
-        $pw = if ($env:SIGNING_PFX_PASSWORD) { ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force } else { $null }
-        $cert = Import-PfxCertificate -FilePath $env:SIGNING_PFX -CertStoreLocation Cert:\CurrentUser\My -Password $pw
-        if (-not $cert) { throw "could not import $($env:SIGNING_PFX)" }
-    } elseif ($env:SIGNING_THUMBPRINT) {
-        $want = $env:SIGNING_THUMBPRINT.Replace(' ', '').ToUpperInvariant()
-        $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $want } | Select-Object -First 1
-        if (-not $cert) { throw "SIGNING_THUMBPRINT $want is not in CurrentUser\My on this machine" }
-        if (-not $cert.HasPrivateKey) { throw "SIGNING_THUMBPRINT $want has no private key here, so it cannot sign" }
-    } else {
-        $durable = $false
-        $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date) } | Sort-Object NotAfter -Descending | Select-Object -First 1
-        if (-not $cert) {
-            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject `
-                -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
-        }
+    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date) } | Sort-Object NotAfter -Descending | Select-Object -First 1
+    if (-not $cert) {
+        $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject `
+            -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
     }
-    Write-Host "signing key: $($cert.Thumbprint)  $($cert.Subject)"
-    if (-not $durable) {
-        Write-Host "  MACHINE-LOCAL KEY -- development build."
-        Write-Host "  No other machine can reproduce this signature and no grant on the fleet"
-        Write-Host "  covers it. ``just release-signed`` replaces it with the Artifact Signing"
-        Write-Host "  certificate; that, not this build, is what ships."
-    }
+    Write-Host "build-machine signing key: $($cert.Thumbprint)  $($cert.Subject)"
+    Write-Host "  development build; ``just release-signed`` replaces this signature and is what ships"
     # Rebuild, not Build: `sign-addin` rewrites the assembly and both manifests in bin, and an
     # incremental build over that leaves whichever of them it judges up to date.
     msbuild OutlookFileDrag\OutlookFileDrag.csproj /t:Rebuild `
@@ -443,6 +416,32 @@ release-signed version='': build sign-addin (wix version) (sign-msi version) (ve
 [unix]
 release-signed version='':
     @echo 'release-signed is Windows-only.'; exit 1
+
+# Publish the GitHub release for the tag HEAD carries, with the signed MSIs in dist/.
+#
+# No workflow publishes a release: the signing identity is a person's Azure login, so the
+# release is built where that login is. `verify-signed` runs first, so what is uploaded is
+# what was read back; a commit that is not a release tag is refused.
+[doc('Create the GitHub release for the tagged commit from the signed MSIs')]
+[group('release')]
+[windows]
+publish: verify-signed
+    #!pwsh
+    $ErrorActionPreference = 'Stop'
+    $ver = ({{ MINVER }}).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $ver) { throw "MinVer failed to derive a version (exit $LASTEXITCODE)" }
+    if ($ver.Contains('-')) { throw "HEAD is $ver, not a release tag; tag it first: just tag <version>" }
+    if (git status --porcelain) { throw 'the working tree has uncommitted changes; the release is built from the tagged commit' }
+    $built = (Select-String -LiteralPath 'OutlookFileDrag/Properties/VersionInfo.cs' -SimpleMatch 'AssemblyFileVersion' | Select-Object -First 1).Line.Split([char]'"')[1]
+    if ($built -ne "$ver.0") { throw "dist/ was built as file version $built and the tag is $ver; run: just release-signed" }
+    $msis = @(Get-ChildItem -LiteralPath 'dist' -Filter "OutlookFileDrag-$ver-*.msi")
+    gh release create "v$ver" @($msis.FullName) --verify-tag --title "v$ver" --generate-notes
+    if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
+
+[group('release')]
+[unix]
+publish:
+    @echo 'publish is Windows-only.'; exit 1
 
 # --- Maintenance ----------------------------------------------------------
 

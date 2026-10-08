@@ -6,8 +6,8 @@ name: CI
 #    without a Windows runner).
 #  - build-windows: the full VSTO add-in + WiX MSIs. This is the slow/expensive
 #    job, so it is gated to the release line -- pushes to `master` and
-#    `release/**` -- and does NOT run on pull requests. Release tags are covered
-#    separately by release.yml.
+#    `release/**` -- and does NOT run on pull requests. It is a development
+#    build: no workflow signs or publishes a release (justfile, `release-signed`).
 
 on:
   push:

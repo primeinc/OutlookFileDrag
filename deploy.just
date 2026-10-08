@@ -286,9 +286,12 @@ trust-script: cert-export
     } else {
         "stores     : TrustedPublisher only (issued by $($signer.Issuer); no root deployment)"
     }
-    # Purge any other certificate under the same subject before adding this one.
-    # Every build machine mints its own key under one fixed subject name, so a
-    # device can accumulate publisher trust for keys that signed nothing it runs.
+    # Purge any other SELF-SIGNED certificate under the same subject before adding
+    # this one. Every build machine mints its own key under one fixed subject name,
+    # so a device can accumulate publisher trust for keys that signed nothing it
+    # runs. CA-issued certificates under the same subject stay: Artifact Signing
+    # issues a different one each day, the release a device still runs was signed
+    # by an earlier one, and removing it would stop that release loading there.
     $lines = @(
         "`$ErrorActionPreference = 'Stop'"
         "`$raw = [Convert]::FromBase64String('$cer')"
@@ -296,7 +299,7 @@ trust-script: cert-export
         "foreach (`$name in $stores) {"
         "    `$store = [System.Security.Cryptography.X509Certificates.X509Store]::new(`$name, 'LocalMachine')"
         "    `$store.Open('ReadWrite')"
-        "    foreach (`$old in @(`$store.Certificates | Where-Object { `$_.Subject -eq `$cert.Subject -and `$_.Thumbprint -ne `$cert.Thumbprint })) {"
+        "    foreach (`$old in @(`$store.Certificates | Where-Object { `$_.Subject -eq `$cert.Subject -and `$_.Subject -eq `$_.Issuer -and `$_.Thumbprint -ne `$cert.Thumbprint })) {"
         "        `$store.Remove(`$old)"
         "        Write-Output `"removed stale `$(`$old.Thumbprint) from LocalMachine\`$name`""
         "    }"
@@ -319,7 +322,7 @@ trust-script: cert-export
 # Create or update the Intune platform script and target every managed device.
 [doc('Publish publisher trust to Intune (all devices, SYSTEM context)')]
 [group('trust')]
-[confirm("Deploy the OutlookFileDrag signing certificate to TrustedPublisher AND Root on every managed device. Continue?")]
+[confirm("Deploy the OutlookFileDrag signing certificate to the machine trust stores of every managed device (TrustedPublisher; Root as well only when it is self-signed). Continue?")]
 [windows]
 [script]
 trust-deploy: graph-login trust-script
@@ -1102,6 +1105,58 @@ lab-push $vm:
         $sent++
     }
     "pushed $sent file(s) to C:\ProgramData\ofd-probe on vm $env:vm, hashes match"
+
+# Copy one file of any size into a lab guest, as SYSTEM, and prove the copy by hash.
+#
+# The transport puts each call's payload on one `qm guest exec` command line, about
+# 11,000 script characters before the 32 KB Windows argv limit. A file therefore
+# travels as a run of base64 pieces appended to <dest>.part, each acknowledged by
+# the size it leaves behind, and takes its name only once the whole hashes right.
+[doc('Copy a file into a lab VM in pieces and verify its hash: lab-put 303 dist\x.msi C:\ProgramData\ofd-probe\x.msi')]
+[group('verify')]
+[windows]
+[script]
+lab-put $vm $file $dest:
+    $ErrorActionPreference = 'Stop'
+    $src = (Resolve-Path $env:file).Path
+    $dest = $env:dest
+    if ($dest.Contains("'")) { throw "the destination path may not contain a single quote: $dest" }
+    $bytes = [IO.File]::ReadAllBytes($src)
+    $hash = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash
+    # 7,500 bytes is 10,000 base64 characters; with the lines around it, about 28 KB of argv.
+    $piece = 7500
+    # The guest's progress stream comes back on stderr as CLIXML, once per call. It is kept
+    # with the output and shown when a call fails.
+    function Send-Lines([string[]] $Lines) {
+        $out = @(($Lines -join "`n") | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" })
+        if ($LASTEXITCODE -ne 0) { throw "vm $env:vm did not take a piece (exit $LASTEXITCODE): $($out -join ' ')" }
+        $out -join "`n"
+    }
+    $null = Send-Lines @(
+        "New-Item -ItemType Directory -Force -Path (Split-Path -Parent '$dest') | Out-Null"
+        "[IO.File]::WriteAllBytes('$dest.part', [byte[]]@())"
+        "'started'"
+    )
+    $pieces = 0
+    for ($at = 0; $at -lt $bytes.Length; $at += $piece) {
+        $len = [Math]::Min($piece, $bytes.Length - $at)
+        $b64 = [Convert]::ToBase64String($bytes, $at, $len)
+        $out = Send-Lines @(
+            "`$f = [IO.File]::Open('$dest.part', 'Append')"
+            "try { `$b = [Convert]::FromBase64String('$b64'); `$f.Write(`$b, 0, `$b.Length) } finally { `$f.Dispose() }"
+            "'size ' + (Get-Item -LiteralPath '$dest.part').Length + ' end'"
+        )
+        if (-not $out.Contains("size $($at + $len) end")) { throw "the piece at byte $at did not land: $out" }
+        $pieces++
+    }
+    $out = Send-Lines @(
+        "`$h = (Get-FileHash -LiteralPath '$dest.part' -Algorithm SHA256).Hash"
+        "if (`$h -ne '$hash') { throw `"guest copy hashes to `$h`" }"
+        "Move-Item -LiteralPath '$dest.part' -Destination '$dest' -Force"
+        "'landed ' + `$h"
+    )
+    if (-not $out.Contains("landed $hash")) { throw "guest copy of $src does not hash to ${hash}: $out" }
+    "$src -> vm $env:vm $dest : $($bytes.Length) bytes in $pieces piece(s), sha256 $hash"
 
 # Same probe, in a lab guest's INTERACTIVE session, so the live Outlook add-in
 # state is visible. Sign a user in and start Outlook first: an add-in that never

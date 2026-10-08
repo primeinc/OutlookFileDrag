@@ -60,10 +60,12 @@ locally and in CI. List them with `just`:
 | --- | --- | --- |
 | `just version` | any OS | Print the MinVer-derived version (from git tags). |
 | `just compile-check` | any OS | `dotnet build` of the platform-independent interop core (`ci/compile-check/`) — a fast compile gate, no Visual Studio. |
-| `just build` | Windows | Builds the VSTO add-in with MSBuild (signs the ClickOnce manifest with an ephemeral self-signed cert), version-stamped from MinVer. |
+| `just build` | Windows | Builds the VSTO add-in with MSBuild, version-stamped from MinVer. The ClickOnce manifests carry a build-machine signature: a development build. |
 | `just msi [version]` | Windows | Builds the x86 + x64 MSIs with WiX into `dist/` (version from MinVer unless one is given). |
-| `just release [version]` | Windows | `build` then `msi` — the full set of artifacts. |
-| `just tag <version>` | any OS | Create + push an annotated `v<version>` tag, triggering a release. |
+| `just release [version]` | Windows | `build` then `msi` — a development build's artifacts; what CI runs. |
+| `just release-signed` | Windows | `build`, then signs the assembly, both ClickOnce manifests and both MSIs with Azure Artifact Signing and reads each MSI's payload back. What ships. Needs `az login` as the certificate profile's signer. |
+| `just tag <version>` | any OS | Create + push an annotated `v<version>` tag. |
+| `just publish` | Windows | Create the GitHub release for the tagged commit from the signed MSIs. |
 
 **Prerequisites**
 
@@ -84,15 +86,17 @@ repo. An annotated tag `v1.2.3` yields version `1.2.3`; commits after a tag yiel
 and to the assembly (`AssemblyVersion`/`FileVersion`/`InformationalVersion`, generated
 into the git-ignored `OutlookFileDrag/Properties/VersionInfo.cs` by `just build`).
 
+Every build has its own file version, because Windows Installer keeps an installed file
+whose version equals the incoming one: release `1.2.3` is `1.2.3.0`, and the build `N`
+commits after it is `1.2.3.N`.
+
 - Print the current version: `just version`.
-- Cut a release: `just tag 1.2.3` (creates + pushes `v1.2.3`, triggering `release.yml`).
-- One-time baseline — this fork has no version tags yet, so anchor MinVer by tagging the
-  current state once, e.g. `just tag 1.0.13`; until then builds report `1.0.0-alpha.0.N`.
+- Cut a release: `just tag 1.2.3`, `just release-signed`, `just publish`.
 
 **CI / releases** (`.github/workflows/`)
 
-- `ci.yml` — the Linux `compile-check` on every push/PR; the full Windows add-in + MSI build (`build-windows.yml`, on `windows-2022`) on pushes to `master` / `release/**` only (gated off PRs to keep them fast). Release tags are covered by `release.yml`.
-- `release.yml` — on a pushed `v*` tag: builds the MSIs (version derived from the tag by MinVer) and publishes a GitHub Release with them attached.
+- `ci.yml` — the Linux `compile-check` on every push/PR; the full Windows add-in + MSI build (`build-windows.yml`, on `windows-2022`) on pushes to `master` / `release/**` only (gated off PRs to keep them fast).
+- No workflow publishes a release. A release is signed with Azure Artifact Signing under a person's Azure login, so it is built and published where that login is (`just release-signed`, `just publish`).
 
 ## Installation
 
