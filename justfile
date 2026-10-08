@@ -327,6 +327,8 @@ sign-msi version='':
 #     deployment manifest, equals the file in the payload
 #   - OutlookFileDrag.dll has the file version this commit builds
 # Prints the signing certificate: `deploy::*` must carry exactly that one to the fleet.
+# Writes dist/OutlookFileDrag-<version>.payload.json, each MSI's OutlookFileDrag.dll by hash,
+# which `publish` holds the lab user-flow record against.
 [doc('Verify the signatures, manifest hashes and file version inside both MSIs')]
 [group('release')]
 [positional-arguments]
@@ -355,6 +357,7 @@ verify-signed version='':
         $sig.SignerCertificate
     }
     $signers = @{}
+    $payload = [ordered]@{}
     foreach ($msi in $msis) {
         $outer = Assert-Authenticode $msi.FullName
         $work = Join-Path ([IO.Path]::GetTempPath()) ("ofd-verify-" + [Guid]::NewGuid().ToString('N'))
@@ -391,12 +394,17 @@ verify-signed version='':
                 }
             }
             $signers[$dll.Thumbprint] = $dll
+            $payload[$msi.Name] = [ordered]@{
+                fileVersion = $got
+                dllSha256   = (Get-FileHash -LiteralPath (Join-Path $dir 'OutlookFileDrag.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
             Write-Host "$($msi.Name): MSI signed by $($outer.Thumbprint); payload file version $got, assembly and both manifests signed by $($dll.Thumbprint), hashes match"
         } finally {
             Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
     if ($signers.Count -ne 1) { throw "the MSIs carry manifests signed by $($signers.Count) different certificates: $($signers.Keys -join ', ')" }
+    $payload | ConvertTo-Json | Set-Content -LiteralPath "dist/OutlookFileDrag-$core.payload.json" -Encoding utf8
     $s = @($signers.Values)[0]
     Write-Host "manifest signer: $($s.Thumbprint)  $($s.Subject)"
     Write-Host "  issued by $($s.Issuer), valid $($s.NotBefore.ToUniversalTime().ToString('u')) to $($s.NotAfter.ToUniversalTime().ToString('u'))"
@@ -422,6 +430,11 @@ release-signed version='':
 # No workflow publishes a release: the signing identity is a person's Azure login, so the
 # release is built where that login is. `verify-signed` runs first, so what is uploaded is
 # what was read back; a commit that is not a release tag is refused.
+#
+# The build must also have passed the user flow on a lab VM: Outlook loading it and a dragged
+# e-mail arriving as a file (`deploy::lab-install`, then `deploy::lab-flow <vm> on`). The
+# record in dist/lab-flow/ names the OutlookFileDrag.dll it ran by hash, and that hash must be
+# the one inside the x64 MSI.
 [doc('Create the GitHub release for the tagged commit from the signed MSIs')]
 [group('release')]
 [windows]
@@ -435,6 +448,13 @@ publish: verify-signed
     $built = (Select-String -LiteralPath 'OutlookFileDrag/Properties/VersionInfo.cs' -SimpleMatch 'AssemblyFileVersion' | Select-Object -First 1).Line.Split([char]'"')[1]
     if ($built -ne "$ver.0") { throw "dist/ was built as file version $built and the tag is $ver; run: just release-signed" }
     $msis = @(Get-ChildItem -LiteralPath 'dist' -Filter "OutlookFileDrag-$ver-*.msi")
+    $shipped = (Get-Content -LiteralPath "dist/OutlookFileDrag-$ver.payload.json" -Raw | ConvertFrom-Json)."OutlookFileDrag-$ver-x64.msi".dllSha256
+    if (-not $shipped) { throw "dist/OutlookFileDrag-$ver.payload.json names no OutlookFileDrag-$ver-x64.msi" }
+    $passed = @(Get-ChildItem -LiteralPath 'dist/lab-flow' -Filter '*-on-flow.json' -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json } |
+        Where-Object { $_.verdict -eq 'PASS' -and $_.addinFile.sha256 -eq $shipped })
+    if (-not $passed) { throw "no passing user-flow record in dist/lab-flow for this build's OutlookFileDrag.dll ($shipped); run: just deploy lab-install <vm> dist/OutlookFileDrag-$ver-x64.msi, then: just deploy lab-flow <vm> on $ver.0" }
+    Write-Host "user flow passed on $($passed[0].computer), finished $($passed[0].finished), OutlookFileDrag.dll $shipped"
     gh release create "v$ver" @($msis.FullName) --verify-tag --title "v$ver" --generate-notes
     if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
 

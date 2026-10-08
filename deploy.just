@@ -71,6 +71,9 @@ export CONTROL := "tools/Test-TrustControl.ps1"
 # owns the SSH keys and the fleet table.
 export MO_REPO := env('MO_REPO', replace(justfile_directory(), '\', '/') + '/../mo')
 export LAB_VM := env('LAB_VM', '304')
+# The Intune Win32 package that delivers the MSI to the fleet: its install.ps1 and detect.ps1
+# are what lab-install runs.
+export INTUNE_PACKAGE := env('OFD_INTUNE_PACKAGE', replace(justfile_directory(), '\', '/') + '/../az-skills/fleet-grade/win32/outlook-file-drag')
 
 # Graph auth is the wbp-az-skills service principal, certificate, own az profile.
 #
@@ -1157,6 +1160,238 @@ lab-put $vm $file $dest:
     )
     if (-not $out.Contains("landed $hash")) { throw "guest copy of $src does not hash to ${hash}: $out" }
     "$src -> vm $env:vm $dest : $($bytes.Length) bytes in $pieces piece(s), sha256 $hash"
+
+# An interactive desktop on a lab VM, for a test that needs a signed-in user. Windows signs a
+# local standard user in at boot; its password is made in the guest and never leaves it
+# (tools/Set-LabDesktop.ps1). The restart is not waited for: lab-desktop-state answers
+# whether the user is at the console yet.
+[doc('Sign a local test user in at a lab VM console (restarts it): lab-desktop 303')]
+[group('verify')]
+[confirm("Create the local user ofdflow on that machine, set Windows to sign it in at boot, and RESTART it. Lab machines only. Continue?")]
+[windows]
+[script]
+lab-desktop $vm=LAB_VM: (lab-put vm "tools/Set-LabDesktop.ps1" 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1')
+    $ErrorActionPreference = 'Stop'
+    $out = @(
+        "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1' -Mode Start"
+        "if (`$LASTEXITCODE -ne 0) { 'START-FAILED ' + `$LASTEXITCODE; exit 1 }"
+        "& shutdown.exe /r /t 5 /f"
+        "'RESTART-ASKED ' + `$LASTEXITCODE"
+    ) -join "`n" | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" }
+    $out
+    if (-not (($out -join "`n").Contains('RESTART-ASKED 0'))) { throw "vm $env:vm was not set up and restarted" }
+
+[doc('Who is at a lab VM console; exit 0 when it is the test user: lab-desktop-state 303')]
+[group('verify')]
+[no-exit-message]
+[windows]
+[script]
+lab-desktop-state $vm=LAB_VM:
+    $ErrorActionPreference = 'Stop'
+    $out = "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1' -Mode State" |
+        & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" }
+    $line = @($out | Where-Object { $_ -like 'DESKTOP console=*' })
+    if (-not $line) { $out; "vm $env:vm did not answer"; exit 2 }
+    $line[-1]
+    if ($line[-1] -like "DESKTOP console='*\ofdflow'*") { exit 0 }
+    exit 1
+
+# Ending is two steps with a restart between them, because Windows deletes a profile only
+# when nobody is signed in to it: lab-desktop-end puts Winlogon back and restarts, and once
+# the machine answers again lab-desktop-remove deletes the account and its profile.
+[doc('Stop signing the test user in on a lab VM (restarts it): lab-desktop-end 303')]
+[group('verify')]
+[confirm("Put that machine's sign-in settings back and RESTART it. Lab machines only. Continue?")]
+[windows]
+[script]
+lab-desktop-end $vm=LAB_VM:
+    $ErrorActionPreference = 'Stop'
+    $out = @(
+        "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1' -Mode Restore"
+        "if (`$LASTEXITCODE -ne 0) { 'RESTORE-FAILED ' + `$LASTEXITCODE; exit 1 }"
+        "& shutdown.exe /r /t 5 /f"
+        "'RESTART-ASKED ' + `$LASTEXITCODE"
+    ) -join "`n" | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" }
+    $out
+    if (-not (($out -join "`n").Contains('RESTART-ASKED 0'))) { throw "vm $env:vm was not restored and restarted" }
+
+[doc('Delete the test user and its profile from a lab VM: lab-desktop-remove 303')]
+[group('verify')]
+[no-exit-message]
+[windows]
+[script]
+lab-desktop-remove $vm=LAB_VM:
+    $ErrorActionPreference = 'Stop'
+    $out = @(
+        "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1' -Mode Remove"
+        "'REMOVE-EXIT ' + `$LASTEXITCODE"
+    ) -join "`n" | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" }
+    $out
+    if (-not (($out -join "`n").Contains('REMOVE-EXIT 0'))) { exit 1 }
+
+# Copy one file out of a lab guest, as SYSTEM, and prove the copy by hash.
+[doc('Copy a file out of a lab VM in pieces and verify its hash: lab-get 303 C:\Users\x\flow.png dist\flow.png')]
+[group('verify')]
+[windows]
+[script]
+lab-get $vm $file $dest:
+    $ErrorActionPreference = 'Stop'
+    $file = $env:file
+    if ($file.Contains("'")) { throw "the guest path may not contain a single quote: $file" }
+    function Ask([string[]] $Lines) {
+        $out = @(($Lines -join "`n") | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" })
+        if ($LASTEXITCODE -ne 0) { throw "vm $env:vm did not answer (exit $LASTEXITCODE): $($out -join ' ')" }
+        $out
+    }
+    function Between([string[]] $Out, [string] $Open, [string] $Close) {
+        $text = $Out -join ''
+        $a = $text.IndexOf($Open)
+        $b = $text.IndexOf($Close)
+        if ($a -lt 0 -or $b -lt $a) { throw "vm $env:vm sent no $Open...$Close answer: $text" }
+        $text.Substring($a + $Open.Length, $b - $a - $Open.Length)
+    }
+    $head = (Between (Ask @(
+        "if (-not (Test-Path -LiteralPath '$file' -PathType Leaf)) { '<<HEAD absent HEAD>>'; exit 0 }"
+        "`$i = Get-Item -LiteralPath '$file'"
+        "'<<HEAD ' + `$i.Length + ' ' + (Get-FileHash -LiteralPath '$file' -Algorithm SHA256).Hash + ' HEAD>>'"
+    )) '<<HEAD ' ' HEAD>>').Split(' ')
+    if ($head[0] -eq 'absent') { throw "vm $env:vm has no file $file" }
+    $length = [long] $head[0]
+    $hash = $head[1]
+    # 180,000 bytes is 240,000 base64 characters per call.
+    $piece = 180000
+    $stream = New-Object IO.MemoryStream
+    for ($at = 0; $at -lt $length; $at += $piece) {
+        $b64 = Between (Ask @(
+            "`$f = [IO.File]::OpenRead('$file')"
+            "try { `$b = New-Object byte[] $piece; [void] `$f.Seek($at, 'Begin'); `$n = `$f.Read(`$b, 0, `$b.Length); '<<PIECE ' + [Convert]::ToBase64String(`$b, 0, `$n) + ' PIECE>>' } finally { `$f.Dispose() }"
+        )) '<<PIECE ' ' PIECE>>'
+        $bytes = [Convert]::FromBase64String($b64)
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    $dest = $env:dest
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent ([IO.Path]::GetFullPath($dest))) | Out-Null
+    [IO.File]::WriteAllBytes([IO.Path]::GetFullPath($dest), $stream.ToArray())
+    $got = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
+    if ($got -ne $hash) { throw "the copy of $file hashes to $got, the guest file to $hash" }
+    "vm $env:vm $file -> $dest : $length bytes, sha256 $hash"
+
+# Install an MSI on a lab VM the way the fleet gets it: the Intune package's install script as
+# SYSTEM, then its detection script. Exit 0 needs the install to succeed and detection to
+# find it.
+[doc('Install an MSI on a lab VM with the Intune package scripts: lab-install 303 dist\OutlookFileDrag-1.0.14-x64.msi')]
+[group('verify')]
+[no-exit-message]
+[windows]
+[script]
+lab-install $vm $msi:
+    $ErrorActionPreference = 'Stop'
+    $msi = Get-Item -LiteralPath $env:msi
+    $guest = 'C:\ProgramData\ofd-probe\pkg'
+    foreach ($name in 'install.ps1', 'detect.ps1') {
+        if (-not (Test-Path -LiteralPath (Join-Path $env:INTUNE_PACKAGE $name))) { throw "no $name in $env:INTUNE_PACKAGE (OFD_INTUNE_PACKAGE)" }
+    }
+    function Lab([string[]] $Lines) {
+        @(($Lines -join "`n") | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" })
+    }
+    # install.ps1 takes the one MSI beside it.
+    $cleared = (Lab @(
+        "if (Test-Path -LiteralPath '$guest') { Get-ChildItem -LiteralPath '$guest' -Filter '*.msi' | Remove-Item -Force }"
+        "'PKG-CLEARED'"
+    )) -join "`n"
+    if (-not $cleared.Contains('PKG-CLEARED')) { $cleared; throw "vm $env:vm did not answer" }
+    foreach ($file in $msi.FullName, (Join-Path $env:INTUNE_PACKAGE 'install.ps1'), (Join-Path $env:INTUNE_PACKAGE 'detect.ps1')) {
+        & just deploy lab-put $env:vm $file "$guest\$(Split-Path -Leaf $file)"
+        if ($LASTEXITCODE -ne 0) { throw "could not copy $file to vm $env:vm" }
+    }
+    $env:GUEST_TIMEOUT = '600'
+    $ps = '$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe'
+    $out = Lab @(
+        "& `"$ps`" -NoProfile -ExecutionPolicy Bypass -File '$guest\install.ps1'"
+        "'INSTALL-EXIT [' + `$LASTEXITCODE + ']'"
+        "& `"$ps`" -NoProfile -ExecutionPolicy Bypass -File '$guest\detect.ps1'"
+        "'DETECT-EXIT [' + `$LASTEXITCODE + ']'"
+    )
+    $out
+    $text = $out -join "`n"
+    if (-not ($text.Contains('INSTALL-EXIT [0]') -or $text.Contains('INSTALL-EXIT [3010]'))) { exit 1 }
+    if (-not $text.Contains('DETECT-EXIT [0]')) { exit 1 }
+
+# The user flow itself, on a lab VM whose console lab-desktop has signed in: Outlook starts, an
+# e-mail is dragged with the mouse onto tools/drop-inspector.html in Edge, and what the page
+# read is checked against the add-in's log and the file it wrote (tools/Test-DropFlow.ps1).
+# The run's record and a picture of the screen land in dist/lab-flow/.
+#
+# The fleet forces Edge sign-in (BrowserSignin=2) and a local account has nothing to sign in
+# with: Edge opens its sign-in page in place of any other. The value is 0 for the run and 2
+# again after it; device management also rewrites it at its next sync.
+#
+# The flow outlives one guest call, so it is started in the user's session and its process
+# is then waited on from SYSTEM.
+[doc('Drag an e-mail from Outlook onto the drop page on a lab VM: lab-flow 303 on 1.0.14.0')]
+[group('verify')]
+[no-exit-message]
+[windows]
+[script]
+lab-flow $vm=LAB_VM $hook='on' $want='': (lab-put vm "tools/Test-DropFlow.ps1" 'C:\ProgramData\ofd-probe\Test-DropFlow.ps1') (lab-put vm "tools/drop-inspector.html" 'C:\ProgramData\ofd-probe\drop-inspector.html')
+    $ErrorActionPreference = 'Stop'
+    if ($env:hook -notin 'on', 'off') { throw "hook is on or off, not '$env:hook'" }
+    $version = ''
+    if ($env:want) { $version = " -WantFileVersion $([version] $env:want)" }
+    function Lab([string] $Recipe, [string[]] $Lines) {
+        @(($Lines -join "`n") | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab $Recipe $env:vm 2>&1 | ForEach-Object { "$_" })
+    }
+    $env:GUEST_TIMEOUT = '240'
+    $edge = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+    $was = (Lab 'intune-ps' @(
+        "`$v = `$null; if (Test-Path '$edge') { `$v = (Get-ItemProperty '$edge').BrowserSignin }"
+        "if (`$v -eq 2) { Set-ItemProperty '$edge' BrowserSignin 0 -Type DWord }"
+        "'EDGE-SIGNIN-WAS [' + `$v + ']'"
+    )) -join "`n"
+    if (-not $was.Contains('EDGE-SIGNIN-WAS [')) { $was; throw "vm $env:vm did not answer" }
+    $forced = $was.Contains('EDGE-SIGNIN-WAS [2]')
+    try {
+        $start = (Lab 'intune-user-ps' @(
+            "`$dir = Join-Path `$env:LOCALAPPDATA 'ofd-flow'"
+            "New-Item -ItemType Directory -Force -Path `$dir | Out-Null"
+            "`$p = Start-Process powershell.exe -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path `$dir 'flow.out') -RedirectStandardError (Join-Path `$dir 'flow.err') -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\ofd-probe\Test-DropFlow.ps1 -Hook $env:hook$version'"
+            "'<<FLOW ' + `$p.Id + ' ' + `$dir + ' FLOW>>'"
+        )) -join "`n"
+        $a = $start.IndexOf('<<FLOW ')
+        $b = $start.IndexOf(' FLOW>>')
+        if ($a -lt 0 -or $b -lt $a) { $start; throw "the flow did not start; is the test user signed in on vm $env:vm? (lab-desktop-state)" }
+        $id, $dir = $start.Substring($a + 7, $b - $a - 7).Split(' ', 2)
+        "flow started on vm $env:vm as process $id; record in $dir"
+        $exited = $false
+        for ($n = 0; $n -lt 4 -and -not $exited; $n++) {
+            $exited = ((Lab 'intune-ps' @(
+                "`$p = Get-Process -Id $([int] $id) -ErrorAction SilentlyContinue"
+                "if (`$p -and `$p.ProcessName -eq 'powershell') { 'FLOW-EXITED [' + `$p.WaitForExit(150000) + ']' } else { 'FLOW-EXITED [True]' }"
+            )) -join "`n").Contains('FLOW-EXITED [True]')
+        }
+        $out = Lab 'intune-ps' @(
+            "Get-Content -LiteralPath '$dir\flow.out' -ErrorAction SilentlyContinue"
+            "Get-Content -LiteralPath '$dir\flow.err' -ErrorAction SilentlyContinue"
+        )
+    } finally {
+        if ($forced) {
+            $back = (Lab 'intune-ps' @(
+                "Set-ItemProperty '$edge' BrowserSignin 2 -Type DWord"
+                "'EDGE-SIGNIN-NOW [' + (Get-ItemProperty '$edge').BrowserSignin + ']'"
+            )) -join "`n"
+            if (-not $back.Contains('EDGE-SIGNIN-NOW [2]')) { $back; "WARNING: forced Edge sign-in was not put back on vm $env:vm" }
+        }
+    }
+    $out
+    if (-not $exited) { throw "the flow was still running on vm $env:vm after four waits of 150 s" }
+    foreach ($name in 'flow.json', 'flow.png') {
+        & just deploy lab-get $env:vm "$dir\$name" "dist/lab-flow/$env:vm-$env:hook-$name"
+        if ($LASTEXITCODE -ne 0) { "no $name came back from vm $env:vm" }
+    }
+    $v = @($out | Where-Object { $_ -like 'VERDICT:*' })
+    if (-not $v) { throw "the flow produced no verdict on vm $env:vm" }
+    if ($v[-1] -like 'VERDICT: PASS*') { exit 0 }
+    exit 1
 
 # Same probe, in a lab guest's INTERACTIVE session, so the live Outlook add-in
 # state is visible. Sign a user in and start Outlook first: an add-in that never
