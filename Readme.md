@@ -71,7 +71,7 @@ locally and in CI. List them with `just`:
 
 - [`just`](https://just.systems/man/en/installation.html) — `winget install Casey.Just` / `choco install just` (Windows), `brew install just` / `apt install just` (macOS/Linux).
 - The [.NET SDK](https://dotnet.microsoft.com/download) (6.0+) — for `compile-check` and for the pinned WiX tool (`.config/dotnet-tools.json`, restored with `dotnet tool restore`).
-- **For the Windows add-in + MSI build only:** Visual Studio 2022 with the *Office/SharePoint development* workload (the VSTO build targets are Windows/VS-only and absent from the .NET SDK) and PowerShell 7 (`pwsh`), run from a *Developer PowerShell for VS 2022* so `msbuild` is on `PATH`. (`restore` bootstraps `nuget.exe` itself — via winget, or a pinned, SHA-256-verified download — since Visual Studio doesn't ship one.)
+- **For the Windows add-in + MSI build only:** Visual Studio 2022 with the *Office/SharePoint development* workload (the VSTO build targets are Windows/VS-only and absent from the .NET SDK) and PowerShell 7 (`pwsh`). Any shell works: `build` takes `msbuild` from `PATH` and otherwise finds it through `vswhere`. (`restore` bootstraps `nuget.exe` itself — via winget, or a pinned, SHA-256-verified download — since Visual Studio doesn't ship one.)
 
 WiX is pinned to v7 via `.config/dotnet-tools.json`. The recipes pass
 `-acceptEula wix7` to every `wix` command so the build is non-interactive
@@ -91,7 +91,21 @@ whose version equals the incoming one: release `1.2.3` is `1.2.3.0`, and the bui
 commits after it is `1.2.3.N`.
 
 - Print the current version: `just version`.
-- Cut a release: `just tag 1.2.3`, `just release-signed`, the lab user flow, `just publish`.
+
+**Cutting a release**, in order. `az-skills` and `mo` are checked out beside this repo.
+
+| Step | Where | Command |
+| --- | --- | --- |
+| 1. Tag | here | `just tag 1.2.3` |
+| 2. Build, sign, read back | here | `just release-signed` |
+| 3. Move the Intune package to the version | `az-skills/fleet-grade` | `just win32-version win32/outlook-file-drag 1.2.3`, then commit |
+| 4. Sign a test user in on a lab VM | here | `just deploy lab-desktop 303`, then `just deploy lab-desktop-state 303` until it exits 0 |
+| 5. Release test | here | `just deploy lab-release 303` |
+| 6. Publish | here | `just publish` |
+| 7. Upload to Intune | `az-skills/fleet-grade` | `just win32-pack win32/outlook-file-drag`, then `just win32-put win32/outlook-file-drag` |
+| 8. Give the lab VM back | here | `just deploy lab-desktop-end 303`, then once it has restarted `just deploy lab-desktop-remove 303` |
+
+Step 7 is the rollout: the Intune app is already Required for every Windows device, so each takes the new version at its next check-in, when Outlook does not have the add-in loaded.
 
 **Lab user flow** (`deploy.just`; needs the `mo` lab and the Intune package in `az-skills`)
 
@@ -100,6 +114,7 @@ commits after it is `1.2.3.N`.
 | Recipe | What it does |
 | --- | --- |
 | `just deploy lab-desktop <vm>` | Signs a local test user in at the lab VM's console (restarts it). `lab-desktop-state <vm>` says when it is there. |
+| `just deploy lab-release <vm> [previous tag] [version]` | The release test: removes installed builds, installs the previous release, runs the drag on it, installs the new MSI with the Intune package scripts, runs the drag on the new file version, and runs the control. |
 | `just deploy lab-install <vm> <msi>` | Installs the MSI as SYSTEM with the Intune package's install script, then runs its detection script. |
 | `just deploy lab-flow <vm> on <file version>` | Starts classic Outlook, drags an e-mail with the mouse onto `tools/drop-inspector.html` in Edge, and checks what the page read against the add-in's log and the file it wrote. `off` in place of `on` is the control: the add-in's hook switched off. Record and screen picture land in `dist/lab-flow/`. |
 | `just deploy lab-desktop-end <vm>`, then `lab-desktop-remove <vm>` | Stops signing the test user in (restarts the VM); deletes the user and its profile. |

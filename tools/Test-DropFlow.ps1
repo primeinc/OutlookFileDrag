@@ -118,14 +118,17 @@ function Get-OutlookWindow([int] $ProcessId) {
     $uia::RootElement.FindFirst($scope::Children, (New-Both (New-Is $uia::ProcessIdProperty $ProcessId) (New-Is $uia::ClassNameProperty 'rctrl_renwnd32')))
 }
 
-# Office's own boxes over Outlook: sign-in, licence notice, privacy notice.
+# Office's own surfaces over Outlook: the boxes (sign-in, licence notice, privacy notice) and
+# the tips it points at parts of the window ("New location for Outlook modules and apps"),
+# which sit on top of the message list.
 function Get-OfficePrompts([int] $ProcessId) {
-    @($uia::RootElement.FindAll($scope::Descendants, (New-Both (New-Is $uia::ProcessIdProperty $ProcessId) (New-Is $uia::ClassNameProperty 'NUIDialog'))))
+    $kind = New-Object Windows.Automation.OrCondition((New-Is $uia::ClassNameProperty 'NUIDialog'), (New-Is $uia::ClassNameProperty 'NetUIBeakToolWindow'))
+    @($uia::RootElement.FindAll($scope::Descendants, (New-Both (New-Is $uia::ProcessIdProperty $ProcessId) $kind)))
 }
 
 function Close-OfficePrompt($Dialog) {
     $name = $Dialog.Current.Name
-    foreach ($press in @(@([Windows.Automation.ControlType]::Hyperlink, 'Skip for now'), @([Windows.Automation.ControlType]::Button, 'Close'))) {
+    foreach ($press in @(@([Windows.Automation.ControlType]::Hyperlink, 'Skip for now'), @([Windows.Automation.ControlType]::Button, 'Close'), @([Windows.Automation.ControlType]::Button, 'Got it'))) {
         $element = $Dialog.FindFirst($scope::Descendants, (New-Both (New-Is $uia::ControlTypeProperty $press[0]) (New-Is $uia::NameProperty $press[1])))
         $pattern = $null
         if ($element -and $element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern, [ref] $pattern)) { $pattern.Invoke(); return "$name ($($press[1]))" }
@@ -304,7 +307,34 @@ try {
     $script:outlook = Start-Process -FilePath $outlookExe -ArgumentList $switch, "`"$MailProfile`"" -PassThru
     $script:pace = $script:outlook
     if (-not $script:outlook.WaitForInputIdle(180000)) { throw 'Outlook did not finish starting in 180 s' }
-    $ol = New-Object -ComObject Outlook.Application
+
+    # Office with no account signed in puts a sign-in box over Outlook some seconds after every
+    # start, a licence and a privacy notice behind it, and tips over the window. When the title
+    # bar already shows its Sign in button, the box is waited for; the button can also arrive
+    # after this look, so its absence proves nothing and the boxes are cleared again before the
+    # first automation call answers and before the drag. This comes before anything is asked of
+    # Outlook: with a box up it does not answer automation at all (CO_E_SERVER_EXEC_FAILURE),
+    # which is how a profile's first start failed.
+    $main = Wait-Until -Waiting 'the Outlook window' -Attempts 240 -Test { Get-OutlookWindow $script:outlook.Id }
+    $script:outlookWindow = [IntPtr] $main.Current.NativeWindowHandle
+    [void] (Wait-Until -Waiting "Outlook's title bar" -Attempts 240 -Test { $main.FindFirst($scope::Descendants, (New-Is $uia::ClassNameProperty 'NetUISimpleButton')) })
+    $signInShown = [bool] $main.FindFirst($scope::Descendants, (New-Both (New-Is $uia::ClassNameProperty 'NetUISimpleButton') (New-Is $uia::NameProperty 'Sign in')))
+    if ($signInShown) {
+        [void] (Wait-Until -Waiting "Office's sign-in box (the title bar offers Sign in)" -Attempts 120 -PaceMs 1000 -Test {
+            @(Get-OfficePrompts $script:outlook.Id).Count
+        })
+    }
+    $record.officePrompts = @(Clear-OfficePrompts $script:outlook.Id $main)
+    Step "title bar offered Sign in at start: $signInShown; boxes dismissed: $($record.officePrompts -join ', ')"
+
+    $ol = Wait-Until -Waiting 'Outlook to answer automation' -Attempts 4 -Test {
+        try { New-Object -ComObject Outlook.Application }
+        catch [Runtime.InteropServices.COMException] {
+            # A box opened since; it goes, and Outlook is asked again.
+            $record.officePrompts += @(Clear-OfficePrompts $script:outlook.Id $main)
+            $null
+        }
+    }
     $ns = $ol.GetNamespace('MAPI')
     Step "Outlook $($ol.Version) pid $($script:outlook.Id), profile '$($ns.CurrentProfileName)'"
     $record.outlookVersion = $ol.Version
@@ -348,21 +378,6 @@ try {
     $disabled = @($record.addinStartup | Where-Object { $_.Contains('EnableHook=false') }).Count -gt 0
     if ($Hook -eq 'on') { $record.checks['add-in installed its drag hook at startup'] = $redirected }
     else { $record.checks['add-in logged that its hook is switched off'] = ($disabled -and -not $redirected) }
-
-    # Office with no account signed in puts a sign-in box over Outlook some seconds after every
-    # start, and a licence and a privacy notice behind it. The title bar says whether an account
-    # is signed in; when none is, the box is waited for and the chain dismissed before any input.
-    $main = Wait-Until -Waiting 'the Outlook window' -Test { Get-OutlookWindow $script:outlook.Id }
-    $script:outlookWindow = [IntPtr] $main.Current.NativeWindowHandle
-    $signedOut = [bool] $main.FindFirst($scope::Descendants, (New-Both (New-Is $uia::ClassNameProperty 'NetUISimpleButton') (New-Is $uia::NameProperty 'Sign in')))
-    $record.officeAccountSignedIn = -not $signedOut
-    if ($signedOut) {
-        [void] (Wait-Until -Waiting "Office's sign-in box (no account is signed in to Office)" -Attempts 120 -PaceMs 1000 -Test {
-            @(Get-OfficePrompts $script:outlook.Id).Count
-        })
-    }
-    $record.officePrompts = @(Clear-OfficePrompts $script:outlook.Id $main)
-    Step "Office account signed in: $(-not $signedOut); boxes dismissed: $($record.officePrompts -join ', ')"
 
     # The item to drag: a saved e-mail with an attachment, in the Inbox of the data file.
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -419,6 +434,16 @@ try {
     }
     $late = @(Clear-OfficePrompts $script:outlook.Id $main)
     if ($late.Count) { $record.officePrompts += $late; Step "boxes dismissed before the drag: $($late -join ', ')" }
+    # Nothing may sit on the row where the mouse will press. Whatever Windows reports at that
+    # point is followed up to Outlook's window; another window on the way is a cover.
+    $mainId = $main.GetRuntimeId() -join '.'
+    $walker = [Windows.Automation.TreeWalker]::RawViewWalker
+    for ($e = $uia::FromPoint((New-Object Windows.Point($fromX, $fromY))); $e; $e = $walker.GetParent($e)) {
+        if (($e.GetRuntimeId() -join '.') -eq $mainId) { break }
+        if ($e.Current.ControlType -eq [Windows.Automation.ControlType]::Window) {
+            throw "the e-mail's row is covered at $fromX,$fromY by $($e.Current.ClassName): $($e.Current.Name)"
+        }
+    }
     $box = $row.Current.BoundingRectangle
     $fromX = [int] ($box.Left + [Math]::Min($box.Width / 3, 150))
     $fromY = [int] ($box.Top + $box.Height / 2)
