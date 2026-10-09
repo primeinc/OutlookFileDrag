@@ -5,8 +5,8 @@
 # carry the [windows] attribute and have [unix] stubs that fail with a clear
 # message. The interop-core `compile-check` builds on any OS via `dotnet build`.
 #
-# Run the Windows recipes from a "Developer PowerShell for VS 2022" (which puts
-# `msbuild` on PATH). Visual Studio does NOT ship a standalone `nuget.exe`; the
+# The Windows recipes run from any shell: `build` takes `msbuild` from PATH and
+# otherwise asks vswhere for it. Visual Studio does NOT ship a standalone `nuget.exe`; the
 # `restore` recipe installs Microsoft's portable nuget.exe via winget the first
 # time it isn't already on PATH (falling back to a direct download only where
 # winget is unavailable), so a clean dev box builds with no manual setup. CI
@@ -187,9 +187,19 @@ build: restore
     }
     Write-Host "build-machine signing key: $($cert.Thumbprint)  $($cert.Subject)"
     Write-Host "  development build; ``just release-signed`` replaces this signature and is what ships"
+    # MSBuild from PATH (a developer shell, CI), else the newest Visual Studio's own.
+    $msbuild = (Get-Command msbuild -ErrorAction SilentlyContinue).Source
+    if (-not $msbuild) {
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if (Test-Path -LiteralPath $vswhere) {
+            $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+        }
+    }
+    if (-not $msbuild) { throw 'no MSBuild on PATH and none found by vswhere: install Visual Studio 2022 or its Build Tools with the Office/SharePoint development workload' }
+    Write-Host "msbuild: $msbuild"
     # Rebuild, not Build: `sign-addin` rewrites the assembly and both manifests in bin, and an
     # incremental build over that leaves whichever of them it judges up to date.
-    msbuild OutlookFileDrag\OutlookFileDrag.csproj /t:Rebuild `
+    & $msbuild OutlookFileDrag\OutlookFileDrag.csproj /t:Rebuild `
         /p:Configuration={{ CONFIGURATION }} /p:Platform=AnyCPU `
         /p:ManifestCertificateThumbprint=$($cert.Thumbprint) /v:m /nologo
     if ($LASTEXITCODE -ne 0) { throw "msbuild failed (exit $LASTEXITCODE)" }

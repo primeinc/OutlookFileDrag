@@ -1188,7 +1188,8 @@ lab-desktop $vm=LAB_VM: (lab-put vm "tools/Set-LabDesktop.ps1" 'C:\ProgramData\o
 [script]
 lab-desktop-state $vm=LAB_VM:
     $ErrorActionPreference = 'Stop'
-    $out = "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1' -Mode State" |
+    # Asked of Windows directly: it must answer on a VM that holds none of this repo's files.
+    $out = "'DESKTOP console=''' + (Get-CimInstance Win32_ComputerSystem).UserName + ''''" |
         & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" }
     $line = @($out | Where-Object { $_ -like 'DESKTOP console=*' })
     if (-not $line) { $out; "vm $env:vm did not answer"; exit 2 }
@@ -1204,7 +1205,7 @@ lab-desktop-state $vm=LAB_VM:
 [confirm("Put that machine's sign-in settings back and RESTART it. Lab machines only. Continue?")]
 [windows]
 [script]
-lab-desktop-end $vm=LAB_VM:
+lab-desktop-end $vm=LAB_VM: (lab-put vm "tools/Set-LabDesktop.ps1" 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1')
     $ErrorActionPreference = 'Stop'
     $out = @(
         "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1' -Mode Restore"
@@ -1220,14 +1221,17 @@ lab-desktop-end $vm=LAB_VM:
 [no-exit-message]
 [windows]
 [script]
-lab-desktop-remove $vm=LAB_VM:
+lab-desktop-remove $vm=LAB_VM: (lab-put vm "tools/Set-LabDesktop.ps1" 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1')
     $ErrorActionPreference = 'Stop'
+    # Deleting a profile can outlast one guest call; the call then ends without an answer
+    # while the guest finishes, and a second run completes the removal.
+    $env:GUEST_TIMEOUT = '300'
     $out = @(
         "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\ofd-probe\Set-LabDesktop.ps1' -Mode Remove"
         "'REMOVE-EXIT ' + `$LASTEXITCODE"
     ) -join "`n" | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" }
     $out
-    if (-not (($out -join "`n").Contains('REMOVE-EXIT 0'))) { exit 1 }
+    if (-not (($out -join "`n").Contains('REMOVE-EXIT 0'))) { "the removal did not report back from vm $env:vm; run it again"; exit 1 }
 
 # Copy one file out of a lab guest, as SYSTEM, and prove the copy by hash.
 [doc('Copy a file out of a lab VM in pieces and verify its hash: lab-get 303 C:\Users\x\flow.png dist\flow.png')]
@@ -1392,6 +1396,76 @@ lab-flow $vm=LAB_VM $hook='on' $want='': (lab-put vm "tools/Test-DropFlow.ps1" '
     if (-not $v) { throw "the flow produced no verdict on vm $env:vm" }
     if ($v[-1] -like 'VERDICT: PASS*') { exit 0 }
     exit 1
+
+# The installer's upgrade codes (installer/OutlookFileDrag.wxs, x64 then x86): every build
+# ever installed is a product related to one of them.
+export UPGRADE_CODES := "'{65870D9B-6652-4150-830B-C5199F26E62C}', '{2F626147-8F83-4FC1-9190-32AA4F25D487}'"
+
+# The release test in one step, on a lab VM whose console lab-desktop has signed in.
+#
+# The VM is first put where the fleet is: every installed build is removed, the previous
+# release's MSI installed, and the drag run on that as the baseline. The new MSI then goes on
+# with the Intune package's scripts, the drag is run on its file version, and once more with
+# the hook switched off. The record of the drag on the new build is the one `publish` reads.
+#
+# previous is a release tag; left out, it is the latest published release, which is what the
+# fleet runs until `publish`. version is the build in dist/; left out, it is the one HEAD's
+# tag names. The az-skills package must already be at the new version (`just win32-version`
+# there), because its detection script is what lab-install runs.
+[doc('Previous release, new MSI, drag test and control on a lab VM: lab-release 303')]
+[group('verify')]
+[no-exit-message]
+[windows]
+[script]
+lab-release $vm=LAB_VM $previous='' $version='':
+    $ErrorActionPreference = 'Stop'
+    $core = $env:version
+    if (-not $core) {
+        dotnet tool restore | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore failed (exit $LASTEXITCODE)" }
+        $full = "$(dotnet minver -t v -m 1.0)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $full) { throw "MinVer failed to derive a version (exit $LASTEXITCODE)" }
+        $core = $full.Split([char]'-', 2)[0]
+    }
+    $msi = "dist/OutlookFileDrag-$core-x64.msi"
+    $record = "dist/OutlookFileDrag-$core.payload.json"
+    if (-not (Test-Path -LiteralPath $msi) -or -not (Test-Path -LiteralPath $record)) { throw "no $msi with $record; build it first: just release-signed" }
+    $want = (Get-Content -LiteralPath $record -Raw | ConvertFrom-Json)."OutlookFileDrag-$core-x64.msi".fileVersion
+    if (-not $want) { throw "$record names no file version for OutlookFileDrag-$core-x64.msi" }
+    $prev = $env:previous
+    if (-not $prev) {
+        $prev = "$(gh release view --json tagName --jq .tagName)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $prev) { throw 'could not read the latest release tag (gh release view)' }
+    }
+    if ($prev -eq "v$core") { throw "$prev is this build's own release; name the one the fleet ran before it: just deploy lab-release $env:vm v<x.y.z>" }
+    function Step([string] $What, [string[]] $Recipe) {
+        "===== $What"
+        & just deploy @Recipe
+        if ($LASTEXITCODE -ne 0) { throw "$What failed: just deploy $($Recipe -join ' ')" }
+    }
+    & just deploy lab-desktop-state $env:vm
+    if ($LASTEXITCODE -ne 0) { throw "the test user is not signed in on vm $env:vm; run: just deploy lab-desktop $env:vm" }
+    New-Item -ItemType Directory -Force -Path dist/previous | Out-Null
+    $name = "OutlookFileDrag-$($prev.TrimStart('v'))-x64.msi"
+    gh release download $prev --pattern $name --dir dist/previous --clobber
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "dist/previous/$name")) { throw "release $prev has no $name" }
+    $guest = "C:\ProgramData\ofd-probe\previous\$name"
+    Step "copy $prev to vm $env:vm" @('lab-put', $env:vm, "dist/previous/$name", $guest)
+    "===== remove installed builds and install $prev"
+    $env:GUEST_TIMEOUT = '600'
+    $out = @(
+        "`$installer = New-Object -ComObject WindowsInstaller.Installer"
+        "foreach (`$code in $env:UPGRADE_CODES) { foreach (`$product in @(`$installer.RelatedProducts(`$code))) { `$x = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/x', `$product, '/qn', '/norestart'; 'removed ' + `$product + ' exit ' + `$x.ExitCode } }"
+        "`$x = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', '`"$guest`"', 'ALLUSERS=1', '/qn', '/norestart'"
+        "'PREVIOUS-INSTALLED [' + `$x.ExitCode + '] file version ' + (Get-Item (Join-Path `$env:ProgramFiles '4pp\Outlook File Drag\OutlookFileDrag.dll')).VersionInfo.FileVersion"
+    ) -join "`n" | & just --justfile "$env:MO_REPO/justfile" --working-directory $env:MO_REPO lab intune-ps $env:vm 2>&1 | ForEach-Object { "$_" }
+    $out
+    if (-not (($out -join "`n").Contains('PREVIOUS-INSTALLED [0]'))) { throw "release $prev did not install on vm $env:vm" }
+    Step "drag on $prev, the baseline" @('lab-flow', $env:vm, 'on')
+    Step "install $core with the Intune package scripts" @('lab-install', $env:vm, $msi)
+    Step "drag on $want" @('lab-flow', $env:vm, 'on', $want)
+    Step "control: the same drag with the add-in's hook switched off" @('lab-flow', $env:vm, 'off', $want)
+    "RELEASE-TEST-PASSED file version $want on vm $env:vm, installed over $prev"
 
 # Same probe, in a lab guest's INTERACTIVE session, so the live Outlook add-in
 # state is visible. Sign a user in and start Outlook first: an add-in that never
