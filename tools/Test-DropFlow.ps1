@@ -78,6 +78,8 @@ public static class OfdUi {
 '@
 
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
+# An earlier run's record and picture must not be read as this run's.
+foreach ($old in 'flow.json', 'flow.png') { Remove-Item -LiteralPath (Join-Path $Work $old) -Force -ErrorAction SilentlyContinue }
 $record = [ordered]@{
     hook = $Hook; computer = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"
     started = (Get-Date).ToUniversalTime().ToString('o'); steps = @(); checks = [ordered]@{}
@@ -160,6 +162,16 @@ function Close-Outlook($Process) {
         [void] $Process.CloseMainWindow()
         if (-not $Process.WaitForExit(60000)) { $Process.Kill(); [void] $Process.WaitForExit(15000); Step "Outlook $($Process.Id) did not close in 60 s and was ended" }
     } finally { $script:pace = $before }
+}
+
+function Save-Screen {
+    $bounds = [Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $shot = New-Object Drawing.Bitmap($bounds.Width, $bounds.Height)
+    $graphics = [Drawing.Graphics]::FromImage($shot)
+    try {
+        $graphics.CopyFromScreen($bounds.Location, [Drawing.Point]::Empty, $bounds.Size)
+        $shot.Save((Join-Path $Work 'flow.png'), [Drawing.Imaging.ImageFormat]::Png)
+    } finally { $graphics.Dispose(); $shot.Dispose() }
 }
 
 function Split-Lines([string] $Text) {
@@ -395,10 +407,14 @@ try {
             @($main.FindAll($scope::Descendants, $isRow) | Where-Object { $_.Current.Name -like "*$subject*" })[0]
         }
     } catch {
-        # What the window does expose under that subject, for whoever reads the failure.
+        # What the window does expose, for whoever reads the failure: every row it lists, and
+        # anything of any kind under that subject.
+        $record.rowsListed = @($main.FindAll($scope::Descendants, $isRow) | ForEach-Object { "$($_.Current.ClassName): $($_.Current.Name)" })
         $record.rowsSeen = @($main.FindAll($scope::Descendants, [Windows.Automation.Condition]::TrueCondition) |
             Where-Object { $_.Current.Name -like "*$subject*" } |
             ForEach-Object { "$($_.Current.ControlType.ProgrammaticName) $($_.Current.ClassName): $($_.Current.Name)" })
+        $record.inboxSubjects = @($inbox.Items | ForEach-Object { "$($_.Subject)" })
+        $record.explorerFolder = "$($explorer.CurrentFolder.FolderPath) view=$($explorer.CurrentView.Name) state=$($explorer.WindowState)"
         throw
     }
     $late = @(Clear-OfficePrompts $script:outlook.Id $main)
@@ -463,11 +479,7 @@ window.__flow = new Promise(resolve => {
     $record.page = $seen
     Step "page: dropped=$($seen.dropped) status='$($seen.statusText)'"
 
-    $shot = New-Object Drawing.Bitmap($screen.Width, $screen.Height)
-    $graphics = [Drawing.Graphics]::FromImage($shot)
-    $graphics.CopyFromScreen($screen.Location, [Drawing.Point]::Empty, $screen.Size)
-    $shot.Save((Join-Path $Work 'flow.png'), [Drawing.Imaging.ImageFormat]::Png)
-    $graphics.Dispose(); $shot.Dispose()
+    Save-Screen
 
     $record.addinDrag = Split-Lines (Read-Shared $addinLog).Substring($logAtDrag)
     $written = @()
@@ -502,6 +514,15 @@ window.__flow = new Promise(resolve => {
 catch {
     $record.error = "$($_.Exception.Message) [line $($_.InvocationInfo.ScriptLineNumber)]"
     Step "ERROR $($record.error)"
+    # The screen and Outlook's windows as the failure left them, before anything is closed.
+    try {
+        Save-Screen
+        if ($script:outlook -and -not $script:outlook.HasExited) {
+            $record.windowsAtError = @($uia::RootElement.FindAll($scope::Descendants, (New-Is $uia::ProcessIdProperty $script:outlook.Id)) |
+                Where-Object { $_.Current.ControlType -eq [Windows.Automation.ControlType]::Window } |
+                ForEach-Object { "$($_.Current.ClassName) enabled=$($_.Current.IsEnabled): $($_.Current.Name)" })
+        }
+    } catch { Step "could not record the failure state: $($_.Exception.Message)" }
 }
 finally {
     if ([OfdUi]::ButtonIsDown()) { [void] [OfdUi]::Up() }
